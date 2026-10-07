@@ -1,0 +1,163 @@
+import asyncio
+import json
+import sqlite3
+import time
+from unittest.mock import AsyncMock
+
+import pytest
+
+from gradebot.db import Database
+from gradebot.monitor import Monitor, format_grades
+from gradebot.presentation import paginate, safe_lines, view_markup
+from gradebot.sheets import Sheet
+
+
+def parsed(value="5"):
+    return Sheet([["ФИО", "С1"], ["Иванов Иван", value]])
+
+
+@pytest.fixture
+def db(tmp_path):
+    database = Database(str(tmp_path / "cache.sqlite3"))
+    database.register(123, "Иванов Иван")
+    database.add_sheet(
+        "ОРГ",
+        "https://docs.google.com/spreadsheets/d/org/edit#gid=42",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=parsed(),
+    )
+    yield database
+    database.close()
+
+
+async def test_cached_grades_are_immediate_persisted_and_stale(db):
+    with db.conn:
+        db.cache(1, parsed("3"), fetched_at=1_700_000_000)
+    path = db.all("PRAGMA database_list")[0]["file"]
+    reopened = Database(path)
+    try:
+        monitor = Monitor(reopened, None, AsyncMock())
+        monitor.fetch = AsyncMock(side_effect=RuntimeError("No network"))
+        reports = await asyncio.wait_for(monitor.inspect_user(123), timeout=0.1)
+        assert reports[0]["grades"] == {"С1": "3"}
+        assert reports[0]["stale"]
+        text = format_grades(reports[0])
+        assert "Кэш устарел" in text and "15.11.2023" in text and "МСК" in text
+        monitor.fetch.assert_not_called()
+    finally:
+        reopened.close()
+
+
+async def test_failed_refresh_preserves_cache_and_its_timestamp(db):
+    original = db.all("SELECT * FROM sheet_cache")[0]
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(side_effect=RuntimeError("Google down"))
+    await monitor.scan()
+    current = db.all("SELECT * FROM sheet_cache")[0]
+    assert tuple(original) == tuple(current)
+    assert (await monitor.inspect_user(123))[0]["grades"] == {"С1": "5"}
+
+
+async def test_one_notification_per_user_across_subjects(db):
+    db.add_sheet(
+        "История",
+        "https://docs.google.com/spreadsheets/d/history/edit",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=parsed(""),
+    )
+    db.snapshot(123, 1, {"С1": ""}, [])
+    db.snapshot(123, 2, {"С1": ""}, [])
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(
+        side_effect=[Sheet([["ФИО", "С1", "С2"], ["Иванов Иван", "2", "3"]]), parsed("1")]
+    )
+    await monitor.scan()
+    assert monitor.bot.send_message.await_count == 1
+    text = monitor.bot.send_message.await_args.args[1]
+    assert text == "<b>Найдены новые оценки:</b>\n\nОРГ: 2, 3\n\nИстория: 1\n"
+    assert len(db.all("SELECT * FROM outbox")) == 1
+    monitor.fetch.side_effect = [Sheet([["ФИО", "С1", "С2"], ["Иванов Иван", "2", "3"]]), parsed("1")]
+    await monitor.scan()
+    assert monitor.bot.send_message.await_count == 1
+
+
+async def test_large_notification_is_sent_once_with_pagination(db):
+    headers = ["ФИО"] + [f"С{i}" for i in range(2000)]
+    sheet = Sheet([headers, ["Иванов Иван"] + ["5"] * 2000])
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(return_value=sheet)
+    await monitor.scan()
+    assert monitor.bot.send_message.await_count == 1
+    item = db.all("SELECT * FROM outbox")[0]
+    view = db.all("SELECT * FROM views WHERE id=?", (item["view_id"],))[0]
+    pages = json.loads(view["pages"])
+    assert len(pages) > 1
+    assert all(len(page) <= 3500 for page in pages)
+    assert monitor.bot.send_message.await_args.kwargs["reply_markup"]
+
+
+def test_html_escaping_does_not_break_pages():
+    lines = safe_lines("<script>&" * 1000)
+    pages = paginate(lines)
+    assert all(len(page) <= 3500 for page in pages)
+    assert "<script>" not in "".join(pages)
+    assert "&lt;" in pages[0]
+
+
+def test_legacy_database_migrates_export_urls_and_queue(tmp_path):
+    path = str(tmp_path / "legacy.sqlite3")
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+    CREATE TABLE sheets(id INTEGER PRIMARY KEY,title TEXT,url TEXT UNIQUE,header_row INTEGER,
+                        name_columns TEXT,proposer INTEGER,status TEXT);
+    CREATE TABLE outbox(id INTEGER PRIMARY KEY,user_id INTEGER,text TEXT,status TEXT DEFAULT 'pending');
+    INSERT INTO sheets VALUES(1,'ОРГ','https://docs.google.com/spreadsheets/d/id/export?format=csv&gid=42',
+                              1,'[1]',123,'approved');
+    INSERT INTO outbox(user_id,text) VALUES(123,'old notification');
+    """)
+    connection.close()
+    db = Database(path)
+    try:
+        assert db.all("SELECT url FROM sheets")[0]["url"].endswith("/edit#gid=42")
+        assert "export" not in db.all("SELECT url FROM sheets")[0]["url"]
+        assert db.all("SELECT text FROM outbox")[0]["text"] == "old notification"
+        db.register(123, "Иванов Иван")
+        with db.conn:
+            db.cache(1, parsed(), time.time())
+            db.queue(123, safe_lines("new notification"))
+        assert len(db.all("SELECT * FROM outbox")) == 2
+    finally:
+        db.close()
+
+
+def test_name_change_keeps_moderation_and_table_notifications(db):
+    with db.conn:
+        db.queue(123, ["grades"], kind="grades")
+        db.queue(123, ["moderation"], kind="moderation")
+        db.queue(123, ["table"], kind="table")
+    db.register(123, "Петров Петр")
+    assert [r["kind"] for r in db.all("SELECT kind FROM outbox")] == ["moderation", "table"]
+
+
+def test_new_table_broadcast_is_persistent_and_uses_web_link(db):
+    db.register(456, "Петров Петр")
+    db.add_sheet(
+        "История",
+        "https://docs.google.com/spreadsheets/d/history/export?format=csv&gid=12",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=parsed(),
+        notify=True,
+    )
+    rows = db.all("SELECT * FROM outbox WHERE kind='table'")
+    assert {row["user_id"] for row in rows} == {123, 456}
+    assert all("/edit#gid=12" in row["text"] and "export" not in row["text"] for row in rows)
+    assert all(view_markup(db, row["view_id"]) is None for row in rows)

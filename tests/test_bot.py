@@ -8,7 +8,7 @@ from aiogram.types import Chat, Message, Update, User
 from gradebot.bot import create_router, parse_spec
 from gradebot.db import Database
 from gradebot.monitor import Monitor
-from gradebot.sheets import SheetError
+from gradebot.sheets import Sheet, SheetError
 
 
 def test_spec():
@@ -28,7 +28,7 @@ async def test_non_admin_cannot_add_or_remove(tmp_path):
         bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk")
         bot.session = AsyncMock()
         monitor = Monitor(db, None, bot)
-        monitor.fetch = AsyncMock()
+        monitor.fetch = AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
         dispatcher = Dispatcher()
         dispatcher.include_router(create_router(db, monitor))
         for text in ["/add Матан | https://docs.google.com/spreadsheets/d/id/edit", "/remove 1", "/pending"]:
@@ -63,7 +63,7 @@ async def test_moderation_checks_admin_and_changes_status(tmp_path, user_id, act
         bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk")
         bot.session = AsyncMock()
         monitor = Monitor(db, None, bot)
-        monitor.fetch = AsyncMock()
+        monitor.fetch = AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
         dispatcher = Dispatcher()
         dispatcher.include_router(create_router(db, monitor))
         callback = CallbackQuery(
@@ -132,6 +132,9 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
             Sheet([["ФИО", "С1"], ["Петров Петр", "4"]]),
         ]
     )
+    with h.db.conn:
+        h.db.cache(1, Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
+        h.db.cache(2, Sheet([["ФИО", "С1"], ["Петров Петр", "4"]]))
     await h.send("/start")
     assert await h.state() == Dialog.registration.state
     await h.send("Иванов")
@@ -139,10 +142,10 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
     await h.send("Иванов Иван")
     assert await h.state() is None
     assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
-    assert h.replies()[-2] == "Сохранил, проверяю по таблицам…"
+    assert h.replies()[-2] == "Сохранил, проверяю по таблицам"
     assert "кроме" in h.replies()[-1] and "Физика — ФИО не найдено" in h.replies()[-1]
     assert "С1: 5" not in h.replies()[-1]
-    assert h.monitor.fetch.await_count == 2
+    h.monitor.fetch.assert_not_called()
 
 
 async def test_name_only_saves_and_command_switches_states(dialog_bot):
@@ -150,9 +153,9 @@ async def test_name_only_saves_and_command_switches_states(dialog_bot):
     h.monitor.fetch = AsyncMock()
     await h.send("/start")
     await h.send("/name")
-    assert h.replies()[-1] == "Отправь новое имя, которое хочешь указать."
+    assert h.replies()[-1] == "Отправь новое ФИО"
     await h.send("Иванов Иван")
-    assert h.replies()[-1] == "Сохранил."
+    assert h.replies()[-1] == "Сохранил"
     assert await h.state() is None
     h.monitor.fetch.assert_not_called()
 
@@ -177,7 +180,7 @@ async def test_add_keeps_title_and_link_state_after_parse_error(dialog_bot, monk
     assert await h.state(999) is None
     row = h.db.all("SELECT * FROM sheets")[0]
     assert row["title"] == "Матан" and row["status"] == "approved"
-    assert h.replies()[-1] == "Таблицу добавил."
+    assert "Таблицу добавил" in h.replies()
 
 
 async def test_suggest_saves_pending_and_notifies_admin(dialog_bot, monkeypatch):
@@ -220,14 +223,17 @@ async def test_grades_reads_live_data_without_consuming_notification(dialog_bot)
     )
     h.db.snapshot(123, sheet_id, {"С1": "4"}, [])
     h.monitor.fetch = AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
+    with h.db.conn:
+        h.db.cache(sheet_id, Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
     await h.send("/grades")
-    assert "Матан\nС1: 5" in h.replies()[-1]
+    assert "С1: 5" in h.replies()[-1]
     import json
 
     assert json.loads(h.db.all("SELECT grades FROM snapshots")[0]["grades"]) == {"С1": "4"}
     h.monitor.bot.send_message = AsyncMock()
     await h.monitor.scan()
-    h.monitor.bot.send_message.assert_awaited_once_with(123, "Матан\nС1: 5 (было: 4)")
+    assert h.monitor.bot.send_message.await_count == 1
+    assert "Матан: 5" in h.monitor.bot.send_message.await_args.args[1]
 
 
 async def test_grades_requires_registration(dialog_bot):
@@ -301,8 +307,121 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
 def test_registration_summary_distinguishes_unavailable_from_missing():
     from gradebot.bot import registration_summary
 
-    assert "во всех таблицах." in registration_summary([{"title": "Матан", "status": "found"}])
+    assert "во всех таблицах" in registration_summary([{"title": "Матан", "status": "found"}])
     summary = registration_summary([{"title": "Матан", "status": "unavailable"}])
     assert "Не удалось проверить" in summary
     assert "ФИО не найдено" not in summary
     assert "Таблиц пока нет" in registration_summary([])
+
+
+async def test_grades_and_tables_each_send_one_cached_message(dialog_bot):
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    for index in range(3):
+        h.db.add_sheet(
+            f"Предмет {index}",
+            f"https://docs.google.com/spreadsheets/d/id{index}/edit",
+            1,
+            (1,),
+            999,
+            "approved",
+            parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
+        )
+    h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
+    await h.send("/grades")
+    assert h.bot.session.await_count == 1
+    assert all(f"Предмет {index}" in h.replies()[0] for index in range(3))
+    assert "Последнее обновление" in h.replies()[0]
+    await h.send("/tables")
+    assert h.bot.session.await_count == 2
+    assert "/edit#gid=0" in h.replies()[-1] and "/export" not in h.replies()[-1]
+    h.monitor.fetch.assert_not_called()
+
+
+async def test_pending_is_one_message_with_moderation_actions(dialog_bot):
+    h = dialog_bot
+    for index in range(3):
+        h.db.add_sheet(
+            f"Предмет {index}",
+            f"https://docs.google.com/spreadsheets/d/id{index}/edit",
+            1,
+            (1,),
+            123,
+            "pending",
+        )
+    await h.send("/pending", 999)
+    assert h.bot.session.await_count == 1
+    markup = h.bot.session.await_args.args[1].reply_markup
+    assert len(markup.inline_keyboard) == 3
+    assert all(f"Предмет {index}" in h.replies()[-1] for index in range(3))
+
+
+@pytest.mark.parametrize("action", ["approve", "reject"])
+async def test_moderation_notifies_proposer_once_and_broadcasts_only_approval(dialog_bot, action):
+    from aiogram.types import CallbackQuery
+
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    h.db.register(456, "Петров Петр")
+    sheet_id = h.db.add_sheet(
+        "ОРГ", "https://docs.google.com/spreadsheets/d/org/edit", 1, (1,), 123, "pending"
+    )
+    h.monitor.fetch = AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
+    callback = CallbackQuery(
+        id="query",
+        from_user=User(id=999, is_bot=False, first_name="Admin"),
+        chat_instance="instance",
+        data=f"{action}:{sheet_id}",
+    )
+    for _ in range(2):
+        dispatcher = Dispatcher()
+        dispatcher.include_router(create_router(h.db, h.monitor))
+        await dispatcher.feed_update(h.bot, Update(update_id=1, callback_query=callback))
+    results = h.db.all("SELECT * FROM outbox WHERE kind='moderation'")
+    assert len(results) == 1 and results[0]["user_id"] == 123
+    assert ("одобрена" if action == "approve" else "отклонена") in results[0]["text"]
+    assert results[0]["status"] == "sent"
+    tables = h.db.all("SELECT * FROM outbox WHERE kind='table'")
+    assert len(tables) == (2 if action == "approve" else 0)
+
+
+async def test_paginated_grades_are_owner_scoped_and_survive_restart(dialog_bot):
+    import json
+
+    from aiogram.types import CallbackQuery
+
+    from gradebot.presentation import create_view, view_markup
+
+    h = dialog_bot
+    with h.db.conn:
+        view_id, pages = create_view(h.db, 123, ["<b>Оценки</b>", *["x" * 400 for _ in range(20)]])
+    assert len(pages) > 1
+    path = h.db.all("PRAGMA database_list")[0]["file"]
+    reopened = Database(path)
+    try:
+        dispatcher = Dispatcher()
+        dispatcher.include_router(create_router(reopened, Monitor(reopened, None, h.bot)))
+        message = Message(
+            message_id=10,
+            date=datetime.now(UTC),
+            chat=Chat(id=123, type="private"),
+            text=pages[0],
+            reply_markup=view_markup(reopened, view_id),
+        )
+        for owner in [456, 123]:
+            h.bot.session.reset_mock()
+            callback = CallbackQuery(
+                id="page",
+                from_user=User(id=owner, is_bot=False, first_name="Test"),
+                chat_instance="instance",
+                message=message,
+                data=f"page:{view_id}:1",
+            )
+            await dispatcher.feed_update(h.bot, Update(update_id=10, callback_query=callback))
+            methods = [call.args[1] for call in h.bot.session.await_args_list]
+            edits = [method for method in methods if method.__class__.__name__ == "EditMessageText"]
+            assert len(edits) == (1 if owner == 123 else 0)
+            if edits:
+                assert edits[0].text == json.loads(reopened.all("SELECT pages FROM views")[0]["pages"])[1]
+    finally:
+        reopened.close()

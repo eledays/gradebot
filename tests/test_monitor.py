@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gradebot.db import Database
-from gradebot.monitor import Monitor, changes
+from gradebot.monitor import Monitor
 from gradebot.sheets import Sheet
 
 
@@ -13,6 +13,8 @@ def db(tmp_path):
     database = Database(str(tmp_path / "test.sqlite3"))
     database.register(123, "Иванов Иван Иванович")
     database.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 123, "approved")
+    with database.conn:
+        database.cache(1, parsed())
     yield database
     database.close()
 
@@ -33,12 +35,11 @@ async def test_registration_baseline_new_column_and_edit(db):
     bot.send_message.assert_not_called()
     monitor.fetch.return_value = parsed("4", "5")
     await monitor.scan()
-    assert bot.send_message.await_count == 2
+    assert bot.send_message.await_count == 1
     texts = [call.args[1] for call in bot.send_message.await_args_list]
-    assert any("С1: 4 (было: 5)" in text for text in texts)
-    assert any("С2: 5" in text for text in texts)
+    assert "Матан: 4, 5" in texts[0]
     await monitor.scan()
-    assert bot.send_message.await_count == 2
+    assert bot.send_message.await_count == 1
 
 
 async def test_delivery_retried_after_database_reopen(db):
@@ -87,10 +88,16 @@ def test_name_change_resets_only_that_users_pending_notifications(db):
     assert not db.all("SELECT * FROM outbox")
 
 
-def test_blank_and_removed_columns():
-    assert "оценка удалена" in changes("Матан", {"С1": "5"}, {"С1": ""})[0]
-    assert changes("Матан", {"С1": "5"}, {}) == []
-    assert changes("Матан", {}, {"С1": ""}) == []
+async def test_blank_and_removed_columns(db):
+    monitor = Monitor(db, None, AsyncMock())
+    await monitor.check_user(123)
+    monitor.fetch = AsyncMock(return_value=parsed(""))
+    await monitor.scan()
+    assert "оценка удалена" in monitor.bot.send_message.await_args.args[1]
+    count = monitor.bot.send_message.await_count
+    monitor.fetch.return_value = Sheet([["ФИО", "С2"], ["Иванов Иван Иванович", ""]])
+    await monitor.scan()
+    assert monitor.bot.send_message.await_count == count
 
 
 async def test_registration_checks_all_approved_sheets(db):
@@ -100,8 +107,10 @@ async def test_registration_checks_all_approved_sheets(db):
     )
     monitor = Monitor(db, None, AsyncMock())
     monitor.fetch = AsyncMock(return_value=parsed())
+    with db.conn:
+        db.cache(2, parsed())
     reports = await monitor.check_user(123)
     assert len(reports) == 2
-    assert monitor.fetch.await_count == 2
+    monitor.fetch.assert_not_called()
     assert len(db.all("SELECT * FROM snapshots")) == 2
     assert not db.all("SELECT * FROM outbox")
