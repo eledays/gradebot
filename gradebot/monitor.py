@@ -30,7 +30,7 @@ def format_grades(report):
     if report["status"] == "found":
         filled = [(label, value) for label, value in report["grades"].items() if value.strip()]
         for label, value in filled[-5:]:
-            lines.extend(safe_lines(f"{label}: {value}"))
+            lines.extend(safe_lines(f"- {label}: {value}"))
         if not filled:
             lines.append("Оценок пока нет")
         numbers = [
@@ -134,12 +134,14 @@ class Monitor:
                         )
                         old = json.loads(snapshot[0]["grades"]) if snapshot else {}
                         values = [
-                            value or "оценка удалена"
+                            (column, value or "оценка удалена")
                             for column, value in grades.items()
                             if old.get(column, "") != value
                         ]
                         if values:
-                            lines.extend(safe_lines(f"{sheet['title']}: {', '.join(values)}"))
+                            lines.append(bold(sheet["title"]))
+                            for column, value in values:
+                                lines.extend(safe_lines(f"- {column}: {value}"))
                             lines.append("")
                         self.db.conn.execute(
                             "INSERT INTO snapshots VALUES(?,?,?) "

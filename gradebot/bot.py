@@ -74,14 +74,12 @@ def registration_summary(reports):
     ambiguous = [r["title"] for r in reports if r["status"] == "ambiguous"]
     unavailable = [r["title"] for r in reports if r["status"] == "unavailable"]
     if not missing and not ambiguous and not unavailable:
-        return "Смог найти тебя во всех таблицах"
+        return ""
     lines = []
     if missing or ambiguous:
-        lines.append("Смог найти тебя во всех таблицах, кроме:")
-        lines.extend(f"• {title} — ФИО не найдено" for title in missing)
-        lines.extend(f"• {title} — несколько совпадений; уточни ФИО через /name" for title in ambiguous)
-    elif any(r["status"] == "found" for r in reports):
-        lines.append("Нашёл тебя во всех проверенных таблицах")
+        lines.append("Не смог тебя найти в таблицах:")
+        lines.extend(f"- {title}" for title in missing)
+        lines.extend(f"- {title} — несколько совпадений ФИО" for title in ambiguous)
     if unavailable:
         lines.append("Не удалось проверить таблицы:")
         lines.extend(f"• {title}" for title in unavailable)
@@ -340,19 +338,15 @@ def create_router(db, monitor, contact_username=""):
             lines = [
                 bold(f"Добро пожаловать, {name}"),
                 "Подсказки по управлению можно посмотреть тут — /help",
-                "",
-                *safe_lines(registration_summary(reports)),
             ]
-            lines.extend(
-                [
-                    "",
-                    *[
-                        cache_caption(report) + " " + escape(report["title"])
-                        for report in reports
-                        if report["stale"]
-                    ],
-                ]
-            )
+            summary = registration_summary(reports)
+            if summary:
+                lines.extend(["", *safe_lines(summary)])
+            stale = [
+                cache_caption(report) + " " + escape(report["title"]) for report in reports if report["stale"]
+            ]
+            if stale:
+                lines.extend(["", *stale])
             await send_view(message, db, lines)
         finally:
             if await state.get_state() == Dialog.checking.state:
