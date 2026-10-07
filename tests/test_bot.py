@@ -144,7 +144,7 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
     assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
     assert "Добро пожаловать, Иванов Иван" in h.replies()[-1]
     assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
-    assert "кроме" in h.replies()[-1] and "Физика — ФИО не найдено" in h.replies()[-1]
+    assert "Не смог тебя найти в таблицах:" in h.replies()[-1] and "- Физика" in h.replies()[-1]
     assert "С1: 5" not in h.replies()[-1]
     h.monitor.fetch.assert_not_called()
 
@@ -234,7 +234,7 @@ async def test_grades_reads_live_data_without_consuming_notification(dialog_bot)
     h.monitor.bot.send_message = AsyncMock()
     await h.monitor.scan()
     assert h.monitor.bot.send_message.await_count == 1
-    assert "Матан: 5" in h.monitor.bot.send_message.await_args.args[1]
+    assert "<b>Матан</b>\n- С1: 5" in h.monitor.bot.send_message.await_args.args[1]
 
 
 async def test_grades_requires_registration(dialog_bot):
@@ -308,7 +308,7 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
 def test_registration_summary_distinguishes_unavailable_from_missing():
     from gradebot.bot import registration_summary
 
-    assert "во всех таблицах" in registration_summary([{"title": "Матан", "status": "found"}])
+    assert registration_summary([{"title": "Матан", "status": "found"}]) == ""
     summary = registration_summary([{"title": "Матан", "status": "unavailable"}])
     assert "Не удалось проверить" in summary
     assert "ФИО не найдено" not in summary
@@ -493,4 +493,23 @@ async def test_start_greeting_and_welcome_are_concise(dialog_bot):
     await h.send("Иванов Иван")
     assert "<b>Добро пожаловать, Иванов Иван</b>" in h.replies()[-1]
     assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
+    assert h.bot.session.await_count == 2
+
+
+async def test_successful_registration_shows_only_welcome_and_help(dialog_bot):
+    h = dialog_bot
+    h.db.add_sheet(
+        "ОРГ",
+        "https://docs.google.com/spreadsheets/d/org/edit",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
+    )
+    await h.send("/start")
+    await h.send("Иванов Иван")
+    assert h.replies()[-1] == (
+        "<b>Добро пожаловать, Иванов Иван</b>\nПодсказки по управлению можно посмотреть тут — /help"
+    )
     assert h.bot.session.await_count == 2

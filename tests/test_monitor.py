@@ -37,7 +37,7 @@ async def test_registration_baseline_new_column_and_edit(db):
     await monitor.scan()
     assert bot.send_message.await_count == 1
     texts = [call.args[1] for call in bot.send_message.await_args_list]
-    assert "Матан: 4, 5" in texts[0]
+    assert "<b>Матан</b>\n- С1: 4\n- С2: 5" in texts[0]
     await monitor.scan()
     assert bot.send_message.await_count == 1
 

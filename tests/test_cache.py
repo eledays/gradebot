@@ -80,7 +80,7 @@ async def test_one_notification_per_user_across_subjects(db):
     await monitor.scan()
     assert monitor.bot.send_message.await_count == 1
     text = monitor.bot.send_message.await_args.args[1]
-    assert text == "<b>Найдены новые оценки:</b>\n\nОРГ: 2, 3\n\nИстория: 1\n"
+    assert text == "<b>Найдены новые оценки:</b>\n\n<b>ОРГ</b>\n- С1: 2\n- С2: 3\n\n<b>История</b>\n- С1: 1\n"
     assert len(db.all("SELECT * FROM outbox")) == 1
     monitor.fetch.side_effect = [Sheet([["ФИО", "С1", "С2"], ["Иванов Иван", "2", "3"]]), parsed("1")]
     await monitor.scan()
@@ -176,7 +176,7 @@ def test_grade_summary_shows_last_five_but_statistics_use_every_column():
     }
     text = format_grades(report)
     assert "С1: 10" not in text and "С2: 10" not in text
-    assert all(f"С{i}:" in text for i in range(3, 8))
+    assert all(f"- С{i}:" in text for i in range(3, 8))
     assert "Среднее: 5,71" in text and "Количество оценок: 7" in text
 
 
