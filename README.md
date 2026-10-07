@@ -13,12 +13,26 @@ pip install -e '.[dev]'
 export BOT_TOKEN='токен от @BotFather'
 export DATABASE_PATH='grades.sqlite3'
 export POLL_INTERVAL=60
+export CONTACT_USERNAME='your_telegram_username'
 
 gradebot admin 123456789
 gradebot run
 ```
 
-Файл `.env.example` — пример переменных; `.env` автоматически не загружается.
+Настройки можно сохранить в `.env` в каталоге запуска (пример — `.env.example`):
+
+```dotenv
+BOT_TOKEN=токен_бота
+DATABASE_PATH=grades.sqlite3
+POLL_INTERVAL=60
+CONTACT_USERNAME=your_telegram_username
+```
+
+`.env` загружается автоматически. Переменные окружения имеют приоритет над `.env`, а `--interval`
+переопределяет `POLL_INTERVAL`. Интервал задаётся в секундах и отображается в `/help` в секундах,
+минутах или часах. `CONTACT_USERNAME` — контакт в Telegram, можно с `@` или без него;
+если контакт не указан, строка «Для связи» не показывается. После смены настроек перезапустите бота.
+Справка содержит разделы «Описание» и «Управление», для администратора — также «Админ».
 `gradebot --db /path/group.sqlite3 admin 123456789` позволяет выбрать БД явно.
 Смена администратора — повторный вызов `gradebot admin НОВЫЙ_ID`. ID и права сохраняются в SQLite;
 новый админ должен сам начать диалог с ботом и зарегистрировать ФИО, как остальные студенты.
