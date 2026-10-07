@@ -142,7 +142,8 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
     await h.send("Иванов Иван")
     assert await h.state() is None
     assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
-    assert h.replies()[-2] == "Сохранил, проверяю по таблицам"
+    assert "Добро пожаловать, Иванов Иван" in h.replies()[-1]
+    assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
     assert "кроме" in h.replies()[-1] and "Физика — ФИО не найдено" in h.replies()[-1]
     assert "С1: 5" not in h.replies()[-1]
     h.monitor.fetch.assert_not_called()
@@ -446,3 +447,50 @@ async def test_help_handler_uses_configured_contact_and_interval(dialog_bot):
         assert "каждые 2 мин" in method.text
         assert method.text.endswith("Для связи: @group_admin")
         assert ("<b>Админ</b>" in method.text) == (user_id == 999)
+
+
+@pytest.mark.parametrize("command,user_id", [("/add", 999), ("/suggest", 123)])
+async def test_duplicate_title_retries_before_asking_for_link(dialog_bot, command, user_id):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    h.db.register(user_id, "Иванов Иван")
+    h.db.add_sheet(
+        "Математический анализ", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "pending"
+    )
+    await h.send(command, user_id)
+    await h.send("  математический   АНАЛИЗ  ", user_id)
+    assert await h.state(user_id) == Dialog.title.state
+    assert "Введи другое название" in h.replies()[-1]
+    await h.send("История", user_id)
+    assert await h.state(user_id) == Dialog.link.state
+    assert h.replies()[-1] == "Отправь ссылку на таблицу"
+
+
+async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkeypatch):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    h.db.register(999, "Иванов Иван")
+    await h.send("/add", 999)
+    await h.send("История", 999)
+    h.db.add_sheet("История", "https://docs.google.com/spreadsheets/d/other/edit", 1, (1,), 999, "approved")
+    monkeypatch.setattr(
+        "gradebot.bot.fetch_sheet", AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
+    )
+    await h.send("https://docs.google.com/spreadsheets/d/new/edit", 999)
+    assert await h.state(999) == Dialog.title.state
+    assert "Введи другое название" in h.replies()[-1]
+    assert len(h.db.all("SELECT * FROM sheets")) == 1
+
+
+async def test_start_greeting_and_welcome_are_concise(dialog_bot):
+    h = dialog_bot
+    await h.send("/start")
+    assert "Привет" in h.replies()[-1]
+    assert "уведомления" in h.replies()[-1] and "текущие оценки" in h.replies()[-1]
+    assert "Отправь своё ФИО, чтобы я мог найти тебя в таблицах" in h.replies()[-1]
+    await h.send("Иванов Иван")
+    assert "<b>Добро пожаловать, Иванов Иван</b>" in h.replies()[-1]
+    assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
+    assert h.bot.session.await_count == 2

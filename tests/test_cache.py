@@ -161,3 +161,44 @@ def test_new_table_broadcast_is_persistent_and_uses_web_link(db):
     assert {row["user_id"] for row in rows} == {123, 456}
     assert all("/edit#gid=12" in row["text"] and "export" not in row["text"] for row in rows)
     assert all(view_markup(db, row["view_id"]) is None for row in rows)
+
+
+def test_grade_summary_shows_last_five_but_statistics_use_every_column():
+    report = {
+        "title": "ОРГ",
+        "url": "https://docs.google.com/spreadsheets/d/id/edit",
+        "status": "found",
+        "fetched_at": time.time(),
+        "stale": False,
+        "grades": dict(
+            zip([f"С{i}" for i in range(1, 8)], ["10", "10", "2", "3", "4", "5", "6"], strict=True)
+        ),
+    }
+    text = format_grades(report)
+    assert "С1: 10" not in text and "С2: 10" not in text
+    assert all(f"С{i}:" in text for i in range(3, 8))
+    assert "Среднее: 5,71" in text and "Количество оценок: 7" in text
+
+
+def test_grade_summary_handles_empty_text_zero_and_decimal_grades():
+    report = {
+        "title": "ОРГ",
+        "url": "https://docs.google.com/spreadsheets/d/id/edit",
+        "status": "found",
+        "fetched_at": time.time(),
+        "stale": False,
+        "grades": {"С1": "0", "С2": "", "С3": "н", "С4": "4,5", "С5": "3.0", "С6": " "},
+    }
+    text = format_grades(report)
+    assert "Среднее: 2,5" in text and "Количество оценок: 4" in text
+    report["grades"] = {"С1": "", "С2": " "}
+    text = format_grades(report)
+    assert "Оценок пока нет" in text and "Среднее: —" in text and "Количество оценок: 0" in text
+
+
+def test_duplicate_title_is_rejected_at_database_boundary(db):
+    from gradebot.db import DuplicateTitleError
+
+    with pytest.raises(DuplicateTitleError):
+        db.add_sheet("  орг ", "https://docs.google.com/spreadsheets/d/other/edit", 1, (1,), 999, "pending")
+    assert len(db.all("SELECT * FROM sheets")) == 1
