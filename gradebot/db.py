@@ -40,23 +40,36 @@ class Database:
     def register(self, user_id, name):
         with self.conn:
             old = self.conn.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
-            self.conn.execute("INSERT INTO users VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
-                              (user_id, name))
+            self.conn.execute(
+                "INSERT INTO users VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+                (user_id, name),
+            )
             if old and old[0] != name:
                 self.conn.execute("DELETE FROM snapshots WHERE user_id=?", (user_id,))
                 self.conn.execute("DELETE FROM outbox WHERE user_id=? AND status='pending'", (user_id,))
 
     def add_sheet(self, title, url, header_row, columns, proposer, status):
-        return self.execute("""INSERT INTO sheets(title,url,header_row,name_columns,proposer,status)
+        return self.execute(
+            """INSERT INTO sheets(title,url,header_row,name_columns,proposer,status)
                                VALUES(?,?,?,?,?,?)""",
-                            (title, url, header_row, json.dumps(columns), proposer, status)).lastrowid
+            (title, url, header_row, json.dumps(columns), proposer, status),
+        ).lastrowid
 
     def snapshot(self, user_id, sheet_id, grades, notifications):
         with self.conn:
-            self.conn.execute("INSERT INTO snapshots VALUES(?,?,?) ON CONFLICT(user_id,sheet_id) "
-                              "DO UPDATE SET grades=excluded.grades", (user_id, sheet_id, json.dumps(grades)))
-            self.conn.executemany("INSERT INTO outbox(user_id,text) VALUES(?,?)",
-                                  [(user_id, text) for text in notifications])
+            self.conn.execute(
+                "INSERT INTO snapshots VALUES(?,?,?) ON CONFLICT(user_id,sheet_id) "
+                "DO UPDATE SET grades=excluded.grades",
+                (user_id, sheet_id, json.dumps(grades)),
+            )
+            self.conn.executemany(
+                "INSERT INTO outbox(user_id,text) VALUES(?,?)",
+                [
+                    (user_id, text[offset : offset + 4000])
+                    for text in notifications
+                    for offset in range(0, len(text), 4000)
+                ],
+            )
 
     def close(self):
         self.conn.close()
