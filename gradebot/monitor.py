@@ -19,36 +19,48 @@ def changes(title, old, new):
     ]
 
 
+def format_grades(report):
+    status = report["status"]
+    if status == "found":
+        body = "\n".join(f"{k}: {v}" for k, v in report["grades"].items() if v) or "Оценок пока нет."
+    else:
+        body = {
+            "missing": "Не нашёл ваше ФИО.",
+            "ambiguous": "Нашёл несколько совпадений. Уточните ФИО через /name.",
+            "unavailable": "Не удалось прочитать таблицу. Попробуйте позже.",
+        }[status]
+    return f"{report['title']}\n{body}"
+
+
 class Monitor:
     def __init__(self, db, session, bot):
         self.db, self.session, self.bot = db, session, bot
         self.lock = asyncio.Lock()
 
-    async def check_user(self, user_id, name=None):
-        """Registration establishes a baseline and returns all current grades."""
+    async def inspect_user(self, user_id, *, baseline=False):
+        """Fetch current grades; read-only requests must not consume pending changes."""
         async with self.lock:
-            if name is not None:
-                self.db.register(user_id, name)
             user = self.db.all("SELECT * FROM users WHERE id=?", (user_id,))[0]
             reports = []
             for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
                 try:
                     parsed = await self.fetch(sheet)
                     status, grades = parsed.lookup(user["name"])
-                    if status == "found":
+                    if status == "found" and baseline:
                         self.db.snapshot(user_id, sheet["id"], grades, [])
-                        report = "\n".join(f"{k}: {v}" for k, v in grades.items() if v) or "Оценок пока нет"
-                    else:
-                        report = (
-                            "Несколько совпадений ФИО — уточните имя через /name"
-                            if status == "ambiguous"
-                            else "ФИО не найдено; проверим снова при обновлениях"
-                        )
-                    reports.append(f"{sheet['title']}\n{report}")
                 except Exception:
-                    log.exception("Registration check failed for sheet %s", sheet["id"])
-                    reports.append(f"{sheet['title']}: таблица временно недоступна")
+                    log.exception("User check failed for sheet %s", sheet["id"])
+                    status, grades = "unavailable", {}
+                reports.append({"title": sheet["title"], "status": status, "grades": grades})
             return reports
+
+    async def check_user(self, user_id, name=None):
+        """Compatibility helper: registration baseline and formatted grade reports."""
+        if name is not None:
+            async with self.lock:
+                self.db.register(user_id, name)
+        reports = await self.inspect_user(user_id, baseline=True)
+        return [format_grades(report) for report in reports]
 
     async def fetch(self, sheet):
         return await fetch_sheet(
