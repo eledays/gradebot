@@ -23,21 +23,38 @@ from .monitor import Monitor, cache_caption, format_grades
 from .presentation import bold, safe_lines, send_view, table_link, view_markup
 from .sheets import SheetError, export_url, fetch_sheet, sheet_url, valid_name
 
-USER_HELP = """/start — зарегистрироваться
-/name — изменить ФИО
-/grades — посмотреть свои оценки
-/tables — таблицы группы
-/suggest — предложить таблицу
-/cancel — отменить текущий ввод
-/help — помощь
 
-Когда оценки изменятся, я напишу сам"""
-ADMIN_HELP = """
-
-<b>Управление таблицами</b>
-/add — добавить таблицу
-/pending — предложения на проверку
-/remove — удалить таблицу"""
+def help_message(interval, contact_username, *, admin=False):
+    if interval % 3600 == 0:
+        period = f"{interval // 3600} ч"
+    elif interval % 60 == 0:
+        period = f"{interval // 60} мин"
+    else:
+        period = f"{interval} сек"
+    text = (
+        "<b>Описание</b>\n"
+        "Бот для получения уведомлений об оценках из таблиц ведомостей\n"
+        f"Информация обновляется каждые {period}\n"
+        "Укажи ФИО, а я буду отправлять уведомления о новых оценках\n\n"
+        "<b>Управление</b>\n"
+        "/name — изменить ФИО\n"
+        "/grades — посмотреть свои оценки\n"
+        "/tables — список таблиц\n"
+        "/suggest — предложить таблицу\n\n"
+        "/cancel — отменить текущий ввод\n"
+        "/help — помощь"
+    )
+    if admin:
+        text += (
+            "\n\n<b>Админ</b>\n"
+            "/add — добавить таблицу\n"
+            "/pending — предложения на проверку\n"
+            "/remove — удалить таблицу"
+        )
+    contact = contact_username.strip().lstrip("@")
+    if contact:
+        text += f"\n\nДля связи: @{escape(contact)}"
+    return text
 
 
 class Dialog(StatesGroup):
@@ -85,11 +102,11 @@ def parse_spec(text):
     return pieces[0], url, header, columns
 
 
-def create_router(db, monitor):
+def create_router(db, monitor, contact_username=""):
     router = Router()
 
     def help_text(user_id):
-        return USER_HELP + (ADMIN_HELP if user_id == db.admin_id() else "")
+        return help_message(monitor.interval, contact_username, admin=user_id == db.admin_id())
 
     def registered(user_id):
         return bool(db.all("SELECT id FROM users WHERE id=?", (user_id,)))
@@ -415,13 +432,13 @@ def create_router(db, monitor):
     return router
 
 
-async def run_bot(db, token, interval):
+async def run_bot(db, token, interval, contact_username=""):
     if db.admin_id() is None:
         raise ValueError("Назначьте админа: gradebot admin TELEGRAM_ID")
     async with Bot(token=token) as bot, aiohttp.ClientSession() as session:
         monitor = Monitor(db, session, bot, interval)
         dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
-        dispatcher.include_router(create_router(db, monitor))
+        dispatcher.include_router(create_router(db, monitor, contact_username))
         task = asyncio.create_task(monitor.run(interval))
         try:
             await dispatcher.start_polling(bot)

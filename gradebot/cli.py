@@ -2,11 +2,15 @@ import argparse
 import asyncio
 import logging
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
 
 from .db import Database
 
 
 def main():
+    load_dotenv(Path.cwd() / ".env", override=False)
     parser = argparse.ArgumentParser(description="Telegram grade bot for one university group")
     parser.add_argument("--db", default=os.getenv("DATABASE_PATH", "grades.sqlite3"))
     commands = parser.add_subparsers(dest="command", required=True)
@@ -36,7 +40,7 @@ def main():
             logging.basicConfig(level=logging.INFO)
             from .bot import run_bot
 
-            asyncio.run(run_bot(db, token, args.interval))
+            asyncio.run(run_bot(db, token, args.interval, os.getenv("CONTACT_USERNAME", "")))
     finally:
         db.close()
 
