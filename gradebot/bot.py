@@ -25,14 +25,16 @@ from .presentation import bold, safe_lines, send_view, table_link, view_markup
 from .sheets import SheetError, export_url, fetch_sheet, sheet_url, valid_name
 
 
-def help_message(interval, contact_username, *, admin=False):
+def help_message(interval, contact_username, *, admin=False, name=None, fetched_at=None):
     if interval % 3600 == 0:
         period = f"{interval // 3600} ч"
     elif interval % 60 == 0:
         period = f"{interval // 60} мин"
     else:
         period = f"{interval} сек"
+    greeting = f"Рад тебя видеть, {escape(name)}" if name else "Рад тебя видеть"
     text = (
+        f"{greeting}\n\n"
         "<b>Описание</b>\n"
         "Бот для получения уведомлений об оценках из таблиц ведомостей\n"
         f"Информация обновляется каждые {period}\n"
@@ -55,6 +57,10 @@ def help_message(interval, contact_username, *, admin=False):
     contact = contact_username.strip().lstrip("@")
     if contact:
         text += f"\n\nДля связи: @{escape(contact)}"
+    text += "\n\n" + cache_caption(
+        {"fetched_at": fetched_at, "stale": fetched_at is None or time.time() - fetched_at > interval * 2},
+        label="Последнее обновление кэша",
+    )
     return text
 
 
@@ -105,7 +111,18 @@ def create_router(db, monitor, contact_username=""):
     router = Router()
 
     def help_text(user_id):
-        return help_message(monitor.interval, contact_username, admin=user_id == db.admin_id())
+        users = db.all("SELECT name FROM users WHERE id=?", (user_id,))
+        timestamp = db.all(
+            "SELECT MAX(c.fetched_at) AS timestamp FROM sheet_cache c "
+            "JOIN sheets s ON s.id=c.sheet_id WHERE s.status='approved'"
+        )[0]["timestamp"]
+        return help_message(
+            monitor.interval,
+            contact_username,
+            admin=user_id == db.admin_id(),
+            name=users[0]["name"] if users else None,
+            fetched_at=timestamp,
+        )
 
     def registered(user_id):
         return bool(db.all("SELECT id FROM users WHERE id=?", (user_id,)))

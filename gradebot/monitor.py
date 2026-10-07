@@ -16,13 +16,13 @@ from .sheets import Sheet, fetch_sheet
 log = logging.getLogger(__name__)
 
 
-def cache_caption(report):
+def cache_caption(report, label="Последнее обновление"):
     timestamp = report["fetched_at"]
     if timestamp is None:
         return "<i>Кэш ещё не загружен</i>"
     date = datetime.fromtimestamp(timestamp, ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M:%S МСК")
     prefix = "Кэш устарел · " if report["stale"] else ""
-    return f"<i>{prefix}Последнее обновление: {date}</i>"
+    return f"<i>{prefix}{label}: {date}</i>"
 
 
 def format_grades(report):
