@@ -12,7 +12,9 @@ def test_help_displays_actual_interval_and_contact(interval, label):
     assert "<b>Описание</b>" in text
     assert "<b>Управление</b>" in text
     assert f"каждые {label}" in text
-    assert text.endswith("Для связи: @group_admin")
+    assert "Для связи: @group_admin" in text
+    assert text.startswith("Рад тебя видеть\n")
+    assert text.endswith("<i>Кэш ещё не загружен</i>")
     assert "<b>Админ</b>" not in text and "/add" not in text
     assert "/start" not in text
 

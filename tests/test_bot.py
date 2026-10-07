@@ -445,7 +445,8 @@ async def test_help_handler_uses_configured_contact_and_interval(dialog_bot):
         method = h.bot.session.await_args.args[1]
         assert method.parse_mode == "HTML"
         assert "каждые 2 мин" in method.text
-        assert method.text.endswith("Для связи: @group_admin")
+        assert "Для связи: @group_admin" in method.text
+        assert method.text.endswith("<i>Кэш ещё не загружен</i>")
         assert ("<b>Админ</b>" in method.text) == (user_id == 999)
 
 
@@ -513,3 +514,25 @@ async def test_successful_registration_shows_only_welcome_and_help(dialog_bot):
         "<b>Добро пожаловать, Иванов Иван</b>\nПодсказки по управлению можно посмотреть тут — /help"
     )
     assert h.bot.session.await_count == 2
+
+
+async def test_help_greets_saved_name_and_shows_latest_approved_cache(dialog_bot):
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    for index, status in enumerate(["approved", "approved", "pending"], 1):
+        h.db.add_sheet(
+            f"Предмет {index}", f"https://docs.google.com/spreadsheets/d/id{index}/edit", 1, (1,), 999, status
+        )
+        with h.db.conn:
+            h.db.cache(
+                index,
+                Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
+                fetched_at=1_700_000_000 + (index - 1) * 3600,
+            )
+    await h.send("/help")
+    text = h.replies()[-1]
+    assert text.startswith("Рад тебя видеть, Иванов Иван\n\n")
+    assert text.endswith("<i>Кэш устарел · Последнее обновление кэша: 15.11.2023 02:13:20 МСК</i>")
+    h.db.register(123, "Петров Петр")
+    await h.send("/help")
+    assert h.replies()[-1].startswith("Рад тебя видеть, Петров Петр\n\n")
