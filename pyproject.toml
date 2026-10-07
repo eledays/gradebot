@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "group-grade-bot"
+version = "0.1.0"
+description = "Telegram notifications for university Google Sheets grades"
+requires-python = ">=3.11"
+dependencies = ["aiogram>=3.20,<4", "aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1"]
+
+[project.scripts]
+gradebot = "gradebot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gradebot*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
