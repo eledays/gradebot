@@ -19,6 +19,7 @@ from aiogram.types import (
     Message,
 )
 
+from .db import DuplicateTitleError
 from .monitor import Monitor, cache_caption, format_grades
 from .presentation import bold, safe_lines, send_view, table_link, view_markup
 from .sheets import SheetError, export_url, fetch_sheet, sheet_url, valid_name
@@ -119,7 +120,11 @@ def create_router(db, monitor, contact_username=""):
     async def start(message: Message, state: FSMContext):
         await state.clear()
         await state.set_state(Dialog.registration)
-        await message.answer("Напиши своё ФИО")
+        await message.answer(
+            "Привет\nЯ слежу за оценками в таблицах группы, присылаю уведомления "
+            "об изменениях и показываю текущие оценки\n\n"
+            "Отправь своё ФИО, чтобы я мог найти тебя в таблицах"
+        )
 
     @router.message(Command("help"))
     async def help_command(message: Message):
@@ -331,9 +336,13 @@ def create_router(db, monitor, contact_username=""):
             if not registering:
                 await message.answer("Сохранил")
                 return
-            await message.answer("Сохранил, проверяю по таблицам")
             reports = await monitor.inspect_user(message.from_user.id, baseline=True)
-            lines = safe_lines(registration_summary(reports))
+            lines = [
+                bold(f"Добро пожаловать, {name}"),
+                "Подсказки по управлению можно посмотреть тут — /help",
+                "",
+                *safe_lines(registration_summary(reports)),
+            ]
             lines.extend(
                 [
                     "",
@@ -354,6 +363,11 @@ def create_router(db, monitor, contact_username=""):
         title = message.text.strip()
         if not title or len(title) > 200 or "\n" in title:
             await message.answer("Название должно быть от 1 до 200 символов")
+            return
+        if db.title_exists(title):
+            await message.answer(
+                "Таблица с таким названием уже есть или ждёт проверки\nВведи другое название таблицы"
+            )
             return
         await state.update_data(title=title)
         await state.set_state(Dialog.link)
@@ -382,6 +396,10 @@ def create_router(db, monitor, contact_username=""):
             )
         except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError):
             await message.answer("Не получилось спарсить таблицу — проверь доступ и попробуй ещё раз")
+            return
+        except DuplicateTitleError:
+            await state.set_state(Dialog.title)
+            await message.answer("Таблица с таким названием уже появилась\nВведи другое название таблицы")
             return
         except sqlite3.IntegrityError:
             await message.answer("Таблица уже добавлена или ждёт проверки")

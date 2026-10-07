@@ -1,8 +1,10 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from datetime import datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -26,11 +28,21 @@ def cache_caption(report):
 def format_grades(report):
     lines = [f"<b>{table_link(report['title'], report['url'])}</b>", cache_caption(report)]
     if report["status"] == "found":
-        for label, value in report["grades"].items():
-            if value:
-                lines.extend(safe_lines(f"{label}: {value}"))
-        if not any(report["grades"].values()):
+        filled = [(label, value) for label, value in report["grades"].items() if value.strip()]
+        for label, value in filled[-5:]:
+            lines.extend(safe_lines(f"{label}: {value}"))
+        if not filled:
             lines.append("Оценок пока нет")
+        numbers = [
+            Decimal(value.strip().replace(",", "."))
+            for _, value in filled
+            if re.fullmatch(r"[+-]?\d+(?:[.,]\d+)?", value.strip())
+        ]
+        average = (
+            f"{sum(numbers) / len(numbers):.2f}".rstrip("0").rstrip(".").replace(".", ",") if numbers else "—"
+        )
+        lines.extend(safe_lines(f"Среднее: {average}"))
+        lines.append(f"Количество оценок: {len(filled)}")
     else:
         lines.append(
             {

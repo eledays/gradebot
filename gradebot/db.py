@@ -7,6 +7,14 @@ from .presentation import bold, create_view, table_link
 from .sheets import sheet_url
 
 
+class DuplicateTitleError(ValueError):
+    pass
+
+
+def normalized_title(title):
+    return " ".join(title.casefold().replace("ё", "е").split())
+
+
 class Database:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -69,9 +77,15 @@ class Database:
                     "DELETE FROM outbox WHERE user_id=? AND status='pending' AND kind='grades'", (user_id,)
                 )
 
+    def title_exists(self, title):
+        key = normalized_title(title)
+        return any(normalized_title(row["title"]) == key for row in self.all("SELECT title FROM sheets"))
+
     def add_sheet(self, title, url, header_row, columns, proposer, status, *, parsed=None, notify=False):
         url = sheet_url(url)
         with self.conn:
+            if self.title_exists(title):
+                raise DuplicateTitleError(title)
             sheet_id = self.conn.execute(
                 "INSERT INTO sheets(title,url,header_row,name_columns,proposer,status) VALUES(?,?,?,?,?,?)",
                 (title, url, header_row, json.dumps(columns), proposer, status),
