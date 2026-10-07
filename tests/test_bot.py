@@ -425,3 +425,24 @@ async def test_paginated_grades_are_owner_scoped_and_survive_restart(dialog_bot)
                 assert edits[0].text == json.loads(reopened.all("SELECT pages FROM views")[0]["pages"])[1]
     finally:
         reopened.close()
+
+
+async def test_help_handler_uses_configured_contact_and_interval(dialog_bot):
+    h = dialog_bot
+    h.monitor.interval = 120
+    dispatcher = Dispatcher()
+    dispatcher.include_router(create_router(h.db, h.monitor, "@group_admin"))
+    for user_id in [123, 999]:
+        message = Message(
+            message_id=1,
+            date=datetime.now(UTC),
+            chat=Chat(id=user_id, type="private"),
+            from_user=User(id=user_id, is_bot=False, first_name="Test"),
+            text="/help",
+        )
+        await dispatcher.feed_update(h.bot, Update(update_id=1, message=message))
+        method = h.bot.session.await_args.args[1]
+        assert method.parse_mode == "HTML"
+        assert "каждые 2 мин" in method.text
+        assert method.text.endswith("Для связи: @group_admin")
+        assert ("<b>Админ</b>" in method.text) == (user_id == 999)
