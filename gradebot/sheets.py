@@ -16,15 +16,24 @@ class SheetError(ValueError):
 
 def export_url(url: str) -> str:
     parts = urlsplit(url.strip())
-    match = re.fullmatch(r"/spreadsheets/d/([A-Za-z0-9_-]+)(?:/[^?]*)?", parts.path)
+    match = re.fullmatch(r"/spreadsheets/d/([A-Za-z0-9_-]{1,200})(?:/[^?]*)?", parts.path)
     if parts.scheme != "https" or parts.netloc != "docs.google.com" or not match:
         raise SheetError("Нужна ссылка https://docs.google.com/spreadsheets/d/.../edit#gid=...")
     params = parse_qs(parts.query)
     params.update(parse_qs(parts.fragment))
     gid = params.get("gid", ["0"])[0]
-    if not gid.isdecimal():
+    if not re.fullmatch(r"[0-9]{1,20}", gid):
         raise SheetError("gid листа должен быть числом")
     return f"https://docs.google.com/spreadsheets/d/{match[1]}/export?format=csv&gid={gid}"
+
+
+def sheet_url(url: str) -> str:
+    """Canonical human-readable URL, also accepts legacy CSV export links."""
+    canonical = export_url(url)
+    parts = urlsplit(canonical)
+    sheet_id = parts.path.split("/")[3]
+    gid = parse_qs(parts.query)["gid"][0]
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/edit#gid={gid}"
 
 
 def tokens(name: str) -> Counter:
