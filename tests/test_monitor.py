@@ -114,3 +114,72 @@ async def test_registration_checks_all_approved_sheets(db):
     monitor.fetch.assert_not_called()
     assert len(db.all("SELECT * FROM snapshots")) == 2
     assert not db.all("SELECT * FROM outbox")
+
+
+async def test_manual_refresh_resets_scheduler_deadline(db, monkeypatch):
+    import asyncio
+    import contextlib
+    from types import SimpleNamespace
+
+    import gradebot.monitor as monitor_module
+
+    clock = [100.0]
+    monitor = Monitor(db, None, AsyncMock())
+    monitor._scan = AsyncMock(return_value={"updated": 1, "failed": [], "notifications": 0})
+    delays = asyncio.Queue()
+
+    async def wait_for_reset(awaitable, timeout):
+        delays.put_nowait(timeout)
+        await awaitable
+
+    monkeypatch.setattr(monitor_module, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(monitor_module, "asyncio", SimpleNamespace(wait_for=wait_for_reset))
+    task = asyncio.create_task(monitor.run(60))
+    try:
+        assert await asyncio.wait_for(delays.get(), 1) == 60
+        clock[0] = 110
+        await monitor.scan()
+        assert monitor.next_refresh == 170
+        assert await asyncio.wait_for(delays.get(), 1) == 60
+        clock[0] = 150
+        monitor.schedule_changed.set()
+        assert await asyncio.wait_for(delays.get(), 1) == 20
+        assert monitor._scan.await_count == 2
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def test_scheduled_refresh_waiting_for_manual_does_not_scan_again(db):
+    import asyncio
+
+    monitor = Monitor(db, None, AsyncMock())
+    started, finish = asyncio.Event(), asyncio.Event()
+
+    async def scan():
+        started.set()
+        await finish.wait()
+        return {"updated": 1, "failed": [], "notifications": 0}
+
+    monitor._scan = AsyncMock(side_effect=scan)
+    manual = asyncio.create_task(monitor.scan())
+    await started.wait()
+    background = asyncio.create_task(monitor.scan(scheduled=True))
+    finish.set()
+    await manual
+    assert await background is None
+    assert monitor._scan.await_count == 1
+
+
+async def test_manual_scan_refreshes_cache_and_notifies_without_duplicates(db):
+    monitor = Monitor(db, None, AsyncMock())
+    await monitor.check_user(123)
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+    result = await monitor.scan()
+    assert result == {"updated": 1, "failed": [], "notifications": 1}
+    assert (await monitor.inspect_user(123))[0]["grades"] == {"С1": "4"}
+    assert monitor.bot.send_message.await_count == 1
+    result = await monitor.scan()
+    assert result["notifications"] == 0
+    assert monitor.bot.send_message.await_count == 1

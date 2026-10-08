@@ -536,3 +536,19 @@ async def test_help_greets_saved_name_and_shows_latest_approved_cache(dialog_bot
     h.db.register(123, "Петров Петр")
     await h.send("/help")
     assert h.replies()[-1].startswith("Рад тебя видеть, Петров Петр\n\n")
+
+
+async def test_refresh_is_admin_only_and_reports_failures(dialog_bot):
+    h = dialog_bot
+    h.monitor.scan = AsyncMock(return_value={"updated": 2, "failed": ["История"], "notifications": 1})
+    await h.send("/refresh", 123)
+    h.monitor.scan.assert_not_called()
+    await h.send("/help", 123)
+    assert "/refresh" not in h.replies()[-1]
+    await h.send("/refresh", 999)
+    h.monitor.scan.assert_awaited_once()
+    assert "Обновлено таблиц: 2" in h.replies()[-1]
+    assert "- История" in h.replies()[-1]
+    assert "Уведомлений об изменениях: 1" in h.replies()[-1]
+    await h.send("/help", 999)
+    assert "/refresh" in h.replies()[-1]
