@@ -87,6 +87,7 @@ def dialog_bot(tmp_path):
 
     db = Database(str(tmp_path / "dialogs.sqlite3"))
     db.execute("INSERT INTO settings VALUES('admin','999')")
+    db.grant_members([(123, "ivanov", "Иванов Иван")])
     bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk")
     bot.session = AsyncMock()
     monitor = Monitor(db, None, bot)
@@ -94,6 +95,23 @@ def dialog_bot(tmp_path):
     dispatcher.include_router(create_router(db, monitor))
 
     class Harness:
+        async def callback(self, data, user_id=999):
+            from aiogram.types import CallbackQuery
+
+            callback = CallbackQuery(
+                id="test",
+                from_user=User(id=user_id, is_bot=False, first_name="Test"),
+                chat_instance="instance",
+                data=data,
+                message=Message(
+                    message_id=1,
+                    date=datetime.now(UTC),
+                    chat=Chat(id=user_id, type="private"),
+                    text="Подтверждение",
+                ),
+            )
+            await dispatcher.feed_update(bot, Update(update_id=1, callback_query=callback))
+
         async def send(self, text, user_id=123):
             message = Message(
                 message_id=1,
@@ -114,51 +132,49 @@ def dialog_bot(tmp_path):
             return await context.get_state()
 
     harness = Harness()
-    harness.db, harness.bot, harness.monitor = db, bot, monitor
+    harness.db, harness.bot, harness.monitor, harness.dispatcher = db, bot, monitor, dispatcher
     yield harness
     db.close()
 
 
 async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
-    from gradebot.bot import Dialog
-    from gradebot.sheets import Sheet
-
     h = dialog_bot
-    h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/math/edit", 1, (1,), 999, "approved")
-    h.db.add_sheet("Физика", "https://docs.google.com/spreadsheets/d/physics/edit", 1, (1,), 999, "approved")
-    h.monitor.fetch = AsyncMock(
-        side_effect=[
-            Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
-            Sheet([["ФИО", "С1"], ["Петров Петр", "4"]]),
-        ]
+    h.db.add_sheet(
+        "Матан",
+        "https://docs.google.com/spreadsheets/d/math/edit",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
     )
-    with h.db.conn:
-        h.db.cache(1, Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
-        h.db.cache(2, Sheet([["ФИО", "С1"], ["Петров Петр", "4"]]))
-    await h.send("/start")
-    assert await h.state() == Dialog.registration.state
-    await h.send("Иванов")
-    assert await h.state() == Dialog.registration.state
-    await h.send("Иванов Иван")
-    assert await h.state() is None
-    assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
-    assert "Добро пожаловать, Иванов Иван" in h.replies()[-1]
-    assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
-    assert "Не смог тебя найти в таблицах:" in h.replies()[-1] and "- Физика" in h.replies()[-1]
-    assert "С1: 5" not in h.replies()[-1]
-    h.monitor.fetch.assert_not_called()
-
-
-async def test_name_only_saves_and_command_switches_states(dialog_bot):
-    h = dialog_bot
+    h.db.add_sheet(
+        "Физика",
+        "https://docs.google.com/spreadsheets/d/physics/edit",
+        1,
+        (1,),
+        999,
+        "approved",
+        parsed=Sheet([["ФИО", "С1"], ["Петров Петр", "4"]]),
+    )
     h.monitor.fetch = AsyncMock()
     await h.send("/start")
-    await h.send("/name")
-    assert h.replies()[-1] == "Отправь новое ФИО"
-    await h.send("Иванов Иван")
-    assert h.replies()[-1] == "Сохранил"
     assert await h.state() is None
+    assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
+    assert "Привет, Иванов Иван" in h.replies()[0]
+    assert "- Физика" in h.replies()[-1]
+    assert "Матан" not in h.replies()[-1]
     h.monitor.fetch.assert_not_called()
+
+
+async def test_user_cannot_change_admin_assigned_name(dialog_bot):
+    h = dialog_bot
+    await h.send("/start")
+    await h.send("/name")
+    assert "администратор" in h.replies()[-1]
+    await h.send("Петров Петр")
+    assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
+    assert await h.state() is None
 
 
 async def test_add_keeps_title_and_link_state_after_parse_error(dialog_bot, monkeypatch):
@@ -174,7 +190,7 @@ async def test_add_keeps_title_and_link_state_after_parse_error(dialog_bot, monk
     await h.send("Матан", 999)
     assert await h.state(999) == Dialog.link.state
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
-    assert "Не получилось спарсить" in h.replies()[-1]
+    assert "Не удалось прочитать" in h.replies()[-1]
     assert await h.state(999) == Dialog.link.state
     assert not h.db.all("SELECT * FROM sheets")
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
@@ -249,12 +265,16 @@ async def test_dialogs_are_isolated_between_users(dialog_bot):
     from gradebot.bot import Dialog
 
     h = dialog_bot
+    h.db.grant_members([(456, "petrov", "Петров Петр")])
     await h.send("/start", 123)
-    await h.send("/name", 456)
-    await h.send("Иванов Иван", 456)
-    assert await h.state(123) == Dialog.registration.state
+    await h.send("/start", 456)
+    await h.send("/suggest", 123)
+    assert await h.state(123) == Dialog.title.state
     assert await h.state(456) is None
-    assert h.db.all("SELECT id FROM users")[0]["id"] == 456
+    assert [row["name"] for row in h.db.all("SELECT name FROM users ORDER BY id")] == [
+        "Иванов Иван",
+        "Петров Петр",
+    ]
 
 
 async def test_remove_retries_unknown_id_then_clears_state(dialog_bot):
@@ -270,6 +290,11 @@ async def test_remove_retries_unknown_id_then_clears_state(dialog_bot):
     await h.send("9999", 999)
     assert await h.state(999) == Dialog.remove.state
     await h.send(str(sheet_id), 999)
+    assert await h.state(999) == Dialog.remove_confirm.state
+    assert h.db.all("SELECT * FROM sheets")
+    context = h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999)
+    data = await context.get_data()
+    await h.callback(f"remove:{data['token']}")
     assert await h.state(999) is None
     assert not h.db.all("SELECT * FROM sheets")
 
@@ -465,7 +490,7 @@ async def test_duplicate_title_retries_before_asking_for_link(dialog_bot, comman
     assert "Введи другое название" in h.replies()[-1]
     await h.send("История", user_id)
     assert await h.state(user_id) == Dialog.link.state
-    assert h.replies()[-1] == "Отправь ссылку на таблицу"
+    assert h.replies()[-1].startswith("Отправь ссылку на таблицу")
 
 
 async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkeypatch):
@@ -485,19 +510,18 @@ async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkey
     assert len(h.db.all("SELECT * FROM sheets")) == 1
 
 
-async def test_start_greeting_and_welcome_are_concise(dialog_bot):
+async def test_start_opens_admin_menu_without_student_registration(dialog_bot):
     h = dialog_bot
-    await h.send("/start")
-    assert "Привет" in h.replies()[-1]
-    assert "уведомления" in h.replies()[-1] and "текущие оценки" in h.replies()[-1]
-    assert "Отправь своё ФИО, чтобы я мог найти тебя в таблицах" in h.replies()[-1]
-    await h.send("Иванов Иван")
-    assert "<b>Добро пожаловать, Иванов Иван</b>" in h.replies()[-1]
-    assert "Подсказки по управлению можно посмотреть тут — /help" in h.replies()[-1]
-    assert h.bot.session.await_count == 2
+    await h.send("/start", 999)
+    assert "Панель администратора" in h.replies()[-1]
+    method = h.bot.session.await_args.args[1]
+    labels = [button.text for row in method.reply_markup.keyboard for button in row]
+    assert "Добавить пользователей" in labels
+    assert "Добавить таблицу" in labels
+    assert not h.db.all("SELECT * FROM users")
 
 
-async def test_successful_registration_shows_only_welcome_and_help(dialog_bot):
+async def test_start_uses_assigned_name_and_opens_simple_menu(dialog_bot):
     h = dialog_bot
     h.db.add_sheet(
         "ОРГ",
@@ -509,13 +533,13 @@ async def test_successful_registration_shows_only_welcome_and_help(dialog_bot):
         parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]),
     )
     await h.send("/start")
-    await h.send("Иванов Иван")
-    assert h.replies()[-1] == (
-        "<b>Добро пожаловать, Иванов Иван</b>\n"
-        "Я буду присылать информацию о новых оценках, как только найду их\n"
-        "Подсказки по управлению можно посмотреть тут — /help"
-    )
-    assert h.bot.session.await_count == 2
+    assert len(h.replies()) == 1
+    assert h.replies()[0].startswith("Привет, Иванов Иван!")
+    method = h.bot.session.await_args.args[1]
+    labels = [button.text for row in method.reply_markup.keyboard for button in row]
+    assert "Мои оценки" in labels and "Таблицы" in labels
+    assert "Добавить пользователей" not in labels
+    assert h.db.all("SELECT * FROM snapshots")
 
 
 async def test_help_greets_saved_name_and_shows_latest_approved_cache(dialog_bot):
@@ -582,7 +606,7 @@ async def test_table_link_acknowledges_before_fetch_and_error(dialog_bot, monkey
     await h.send("История", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
     assert h.replies()[-2] == "Секундочку"
-    assert "Не получилось спарсить" in h.replies()[-1]
+    assert "Не удалось прочитать" in h.replies()[-1]
 
 
 async def test_approval_acknowledges_before_fetch(dialog_bot):

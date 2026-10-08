@@ -2,6 +2,7 @@
 
 import json
 import secrets
+import time
 from html import escape
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
@@ -52,8 +53,8 @@ def create_view(db, owner, lines, *, admin=False, actions=None):
             for index, page in enumerate(pages)
         }
     db.conn.execute(
-        "INSERT INTO views(id,owner,pages,admin,actions) VALUES(?,?,?,?,?)",
-        (view_id, owner, json.dumps(pages), int(admin), json.dumps(actions or [])),
+        "INSERT INTO views(id,owner,pages,admin,actions,created_at) VALUES(?,?,?,?,?,?)",
+        (view_id, owner, json.dumps(pages), int(admin), json.dumps(actions or []), time.time()),
     )
     return view_id, pages
 

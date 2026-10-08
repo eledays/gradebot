@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -25,6 +26,8 @@ class Database:
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS members(
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL DEFAULT '');
         CREATE TABLE IF NOT EXISTS sheets(
           id INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
           header_row INTEGER NOT NULL, name_columns TEXT NOT NULL,
@@ -45,11 +48,31 @@ class Database:
         """)
 
         existing = {row["name"] for row in self.all("PRAGMA table_info(outbox)")}
-        for column, definition in [("view_id", "TEXT"), ("kind", "TEXT NOT NULL DEFAULT 'grades'")]:
+        for column, definition in [
+            ("view_id", "TEXT"),
+            ("kind", "TEXT NOT NULL DEFAULT 'grades'"),
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt", "REAL NOT NULL DEFAULT 0"),
+            ("created_at", "REAL NOT NULL DEFAULT 0"),
+        ]:
             if column not in existing:
                 self.conn.execute(f"ALTER TABLE outbox ADD COLUMN {column} {definition}")
+        if "notifications" not in {row["name"] for row in self.all("PRAGMA table_info(users)")}:
+            self.conn.execute("ALTER TABLE users ADD COLUMN notifications INTEGER NOT NULL DEFAULT 1")
+        if "created_at" not in {row["name"] for row in self.all("PRAGMA table_info(views)")}:
+            self.conn.execute("ALTER TABLE views ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
         # Migrate CSV URLs without producing duplicate logical sheets.
         with self.conn:
+            # Never reuse IDs referenced by old Telegram moderation buttons.
+            maximum = self.all("SELECT COALESCE(MAX(id),0) AS n FROM sheets")[0]["n"]
+            for view in self.all("SELECT actions FROM views"):
+                for match in re.finditer(r"(?:approve|reject):(\d+)", view["actions"]):
+                    maximum = max(maximum, int(match[1]))
+            self.conn.execute(
+                "INSERT INTO settings VALUES('sheet_sequence',?) ON CONFLICT(key) "
+                "DO UPDATE SET value=MAX(CAST(settings.value AS INTEGER),CAST(excluded.value AS INTEGER))",
+                (str(maximum),),
+            )
             for row in self.all("SELECT id,url FROM sheets"):
                 self.conn.execute("UPDATE sheets SET url=? WHERE id=?", (sheet_url(row["url"]), row["id"]))
 
@@ -65,17 +88,77 @@ class Database:
         return int(row[0]) if row else None
 
     def register(self, user_id, name):
+        """Internal administrator/test helper. Telegram users never supply their own name."""
+        self.grant_members([(user_id, "", name)])
+        self.activate(user_id)
+
+    def authorized(self, user_id):
+        return user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
+
+    def grant_members(self, entries):
         with self.conn:
-            old = self.conn.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
-            self.conn.execute(
-                "INSERT INTO users VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
-                (user_id, name),
-            )
-            if old and old[0] != name:
-                self.conn.execute("DELETE FROM snapshots WHERE user_id=?", (user_id,))
+            for user_id, username, name in entries:
                 self.conn.execute(
-                    "DELETE FROM outbox WHERE user_id=? AND status='pending' AND kind='grades'", (user_id,)
+                    "INSERT INTO members VALUES(?,?,?) ON CONFLICT(id) "
+                    "DO UPDATE SET name=excluded.name,username=excluded.username",
+                    (user_id, name, username),
                 )
+                if self.all("SELECT id FROM users WHERE id=?", (user_id,)):
+                    self._save_name(user_id, name)
+
+    def activate(self, user_id):
+        member = self.all("SELECT name FROM members WHERE id=?", (user_id,))
+        if not member:
+            return False
+        with self.conn:
+            self._save_name(user_id, member[0]["name"])
+        return True
+
+    def _save_name(self, user_id, name):
+        old = self.conn.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
+        self.conn.execute(
+            "INSERT INTO users(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            (user_id, name),
+        )
+        if old and old[0] != name:
+            self.conn.execute("DELETE FROM snapshots WHERE user_id=?", (user_id,))
+            self.conn.execute(
+                "DELETE FROM views WHERE owner=? AND admin=0 AND id NOT IN "
+                "(SELECT view_id FROM outbox WHERE user_id=? AND status='pending' "
+                "AND kind!='grades' AND view_id IS NOT NULL)",
+                (user_id, user_id),
+            )
+            self.conn.execute(
+                "DELETE FROM outbox WHERE user_id=? AND status='pending' AND kind='grades'", (user_id,)
+            )
+
+    def revoke(self, user_id):
+        with self.conn:
+            result = self.conn.execute("DELETE FROM members WHERE id=?", (user_id,))
+            self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            self.conn.execute("DELETE FROM views WHERE owner=?", (user_id,))
+            self.conn.execute("DELETE FROM outbox WHERE user_id=?", (user_id,))
+        return bool(result.rowcount)
+
+    def toggle_notifications(self, user_id):
+        with self.conn:
+            self.conn.execute("UPDATE users SET notifications=1-notifications WHERE id=?", (user_id,))
+            enabled = self.all("SELECT notifications FROM users WHERE id=?", (user_id,))[0][0]
+            if not enabled:
+                self.conn.execute(
+                    "DELETE FROM outbox WHERE user_id=? AND kind='grades' AND status='pending'", (user_id,)
+                )
+        return bool(enabled)
+
+    def cleanup(self):
+        cutoff = time.time() - 30 * 86400
+        with self.conn:
+            self.conn.execute("DELETE FROM outbox WHERE status!='pending' AND created_at<?", (cutoff,))
+            self.conn.execute(
+                "DELETE FROM views WHERE created_at<? AND id NOT IN "
+                "(SELECT view_id FROM outbox WHERE status='pending' AND view_id IS NOT NULL)",
+                (cutoff,),
+            )
 
     def title_exists(self, title):
         key = normalized_title(title)
@@ -86,10 +169,12 @@ class Database:
         with self.conn:
             if self.title_exists(title):
                 raise DuplicateTitleError(title)
-            sheet_id = self.conn.execute(
-                "INSERT INTO sheets(title,url,header_row,name_columns,proposer,status) VALUES(?,?,?,?,?,?)",
-                (title, url, header_row, json.dumps(columns), proposer, status),
-            ).lastrowid
+            sheet_id = int(self.all("SELECT value FROM settings WHERE key='sheet_sequence'")[0][0]) + 1
+            self.conn.execute("UPDATE settings SET value=? WHERE key='sheet_sequence'", (str(sheet_id),))
+            self.conn.execute(
+                "INSERT INTO sheets(id,title,url,header_row,name_columns,proposer,status) VALUES(?,?,?,?,?,?,?)",
+                (sheet_id, title, url, header_row, json.dumps(columns), proposer, status),
+            )
             if parsed is not None:
                 self.cache(sheet_id, parsed)
             if status == "approved" and notify:
@@ -128,12 +213,12 @@ class Database:
     def queue(self, user_id, lines, *, kind="grades", actions=None, admin=False):
         view_id, pages = create_view(self, user_id, lines, admin=admin, actions=actions)
         self.conn.execute(
-            "INSERT INTO outbox(user_id,text,view_id,kind) VALUES(?,?,?,?)",
-            (user_id, pages[0], view_id, kind),
+            "INSERT INTO outbox(user_id,text,view_id,kind,created_at) VALUES(?,?,?,?,?)",
+            (user_id, pages[0], view_id, kind, time.time()),
         )
 
     def broadcast_table(self, title, url):
-        for user in self.all("SELECT id FROM users"):
+        for user in self.all("SELECT u.id FROM users u JOIN members m ON m.id=u.id"):
             self.queue(
                 user["id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
             )

@@ -28,7 +28,7 @@ def main():
                 "INSERT INTO settings VALUES('admin',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(args.telegram_id),),
             )
-            print(f"Administrator: {args.telegram_id}. Register via /start in Telegram as well.")
+            print(f"Administrator: {args.telegram_id}. Open /start in Telegram to manage access and tables.")
         else:
             if args.interval < 10:
                 parser.error("Polling interval must be at least 10 seconds")
@@ -39,8 +39,13 @@ def main():
                 parser.error("Assign an administrator first: gradebot admin TELEGRAM_ID")
             logging.basicConfig(level=logging.INFO)
             from .bot import run_bot
+            from .runtime import AlreadyRunningError, database_run_lock
 
-            asyncio.run(run_bot(db, token, args.interval, os.getenv("CONTACT_USERNAME", "")))
+            try:
+                with database_run_lock(args.db):
+                    asyncio.run(run_bot(db, token, args.interval, os.getenv("CONTACT_USERNAME", "")))
+            except AlreadyRunningError as exc:
+                parser.error(str(exc))
     finally:
         db.close()
 

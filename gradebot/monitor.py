@@ -7,7 +7,7 @@ from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import LinkPreviewOptions
 
 from .presentation import bold, safe_lines, table_link, view_markup
@@ -63,6 +63,8 @@ class Monitor:
         self.scan_lock = asyncio.Lock()
         self.schedule_changed = asyncio.Event()
         self.next_refresh = 0.0
+        deadline = db.all("SELECT value FROM settings WHERE key='delivery_after'")
+        self.delivery_after = float(deadline[0][0]) if deadline else 0.0
 
     async def inspect_user(self, user_id, *, baseline=False):
         """Read persisted cache only; never wait for Google or mutate it on /grades."""
@@ -130,7 +132,7 @@ class Monitor:
                 for sheet_id, parsed, timestamp in fetched:
                     if self.db.all("SELECT id FROM sheets WHERE id=? AND status='approved'", (sheet_id,)):
                         self.db.cache(sheet_id, parsed, timestamp)
-                for user in self.db.all("SELECT * FROM users"):
+                for user in self.db.all("SELECT u.* FROM users u JOIN members m ON m.id=u.id"):
                     lines = [bold("Найдены новые оценки:"), ""]
                     for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
                         cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
@@ -164,7 +166,7 @@ class Monitor:
                             "ON CONFLICT(user_id,sheet_id) DO UPDATE SET grades=excluded.grades",
                             (user["id"], sheet["id"], json.dumps(grades)),
                         )
-                    if len(lines) > 2:
+                    if len(lines) > 2 and user["notifications"]:
                         self.db.queue(user["id"], lines)
                         notifications += 1
         await self.deliver()
@@ -172,9 +174,21 @@ class Monitor:
 
     async def deliver(self):
         async with self.delivery_lock:
-            for item in self.db.all("SELECT * FROM outbox WHERE status='pending' ORDER BY id LIMIT 100"):
+            if time.time() < self.delivery_after:
+                return
+            for item in self.db.all(
+                "SELECT * FROM outbox WHERE status='pending' AND next_attempt<=? "
+                "ORDER BY next_attempt,id LIMIT 100",
+                (time.time(),),
+            ):
                 # Name changes may discard grade notifications while other messages are retained.
                 if not self.db.all("SELECT id FROM outbox WHERE id=? AND status='pending'", (item["id"],)):
+                    continue
+                if not self.db.authorized(item["user_id"]):
+                    self.db.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
+                    continue
+                if item["kind"] == "proposal" and item["user_id"] != self.db.admin_id():
+                    self.db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (item["id"],))
                     continue
                 try:
                     kwargs = {}
@@ -186,14 +200,42 @@ class Monitor:
                         }
                     await self.bot.send_message(item["user_id"], item["text"], **kwargs)
                 except TelegramForbiddenError:
-                    self.db.execute("UPDATE outbox SET status='blocked' WHERE id=?", (item["id"],))
+                    self.db.execute(
+                        "UPDATE outbox SET status='blocked' WHERE user_id=? AND status='pending'",
+                        (item["user_id"],),
+                    )
+                except TelegramBadRequest:
+                    self.db.execute("UPDATE outbox SET status='failed' WHERE id=?", (item["id"],))
+                    log.exception("Invalid notification %s", item["id"])
                 except TelegramRetryAfter as exc:
-                    await asyncio.sleep(min(exc.retry_after, 60))
+                    self.delivery_after = time.time() + exc.retry_after
+                    self.db.execute(
+                        "INSERT INTO settings VALUES('delivery_after',?) ON CONFLICT(key) "
+                        "DO UPDATE SET value=excluded.value",
+                        (str(self.delivery_after),),
+                    )
+                    self.db.execute(
+                        "UPDATE outbox SET next_attempt=? WHERE status='pending'", (self.delivery_after,)
+                    )
                     break
                 except Exception:
+                    attempts = item["attempts"] + 1
+                    self.db.execute(
+                        "UPDATE outbox SET attempts=?,next_attempt=? WHERE id=?",
+                        (attempts, time.time() + min(3600, 2 ** min(attempts, 12)), item["id"]),
+                    )
                     log.exception("Notification %s will be retried", item["id"])
                 else:
                     self.db.execute("UPDATE outbox SET status='sent' WHERE id=?", (item["id"],))
+
+    async def run_delivery(self):
+        while True:
+            try:
+                await self.deliver()
+                self.db.cleanup()
+            except Exception:
+                log.exception("Delivery iteration failed")
+            await asyncio.sleep(2)
 
     async def run(self, interval):
         self.interval = interval

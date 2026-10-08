@@ -58,3 +58,14 @@ def test_cli_loads_env_and_respects_override_priority(
     monkeypatch.setattr("gradebot.bot.run_bot", fake_run)
     main()
     assert calls == [(999, "fake-token", expected, "group_admin")]
+
+
+def test_second_process_cannot_run_on_same_database(tmp_path):
+    from gradebot.runtime import database_run_lock
+
+    path = tmp_path / "group.sqlite3"
+    with database_run_lock(path):
+        with pytest.raises(RuntimeError, match="уже запущен"), database_run_lock(path):
+            pytest.fail("A competing runner must not obtain the database lock")
+    with database_run_lock(path):
+        pass  # The first process released its lock.

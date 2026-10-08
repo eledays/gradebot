@@ -53,6 +53,9 @@ async def test_delivery_retried_after_database_reopen(db):
     try:
         restarted = Monitor(reopened, None, AsyncMock())
         await restarted.deliver()
+        assert restarted.bot.send_message.await_count == 0  # Backoff survives a restart.
+        reopened.execute("UPDATE outbox SET next_attempt=0")
+        await restarted.deliver()
         assert restarted.bot.send_message.await_count == 1
         assert not reopened.all("SELECT * FROM outbox WHERE status='pending'")
     finally:
@@ -183,3 +186,93 @@ async def test_manual_scan_refreshes_cache_and_notifies_without_duplicates(db):
     result = await monitor.scan()
     assert result["notifications"] == 0
     assert monitor.bot.send_message.await_count == 1
+
+
+async def test_failed_first_hundred_messages_do_not_starve_next_user(db):
+    db.register(456, "Петров Петр")
+    with db.conn:
+        for _ in range(100):
+            db.queue(123, ["temporary error"])
+        db.queue(456, ["healthy recipient"])
+    bot = AsyncMock()
+
+    async def send(user_id, text, **kwargs):
+        if user_id == 123:
+            raise RuntimeError("Network failure")
+
+    bot.send_message.side_effect = send
+    monitor = Monitor(db, None, bot)
+    await monitor.deliver()
+    assert bot.send_message.await_count == 100
+    await monitor.deliver()
+    assert bot.send_message.await_count == 101
+    assert db.all("SELECT status FROM outbox WHERE user_id=456")[0][0] == "sent"
+
+
+async def test_retry_after_respects_full_deadline_after_restart(db, monkeypatch):
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import SendMessage
+
+    import gradebot.monitor as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    with db.conn:
+        db.queue(123, ["grades"])
+    bot = AsyncMock()
+    bot.send_message.side_effect = TelegramRetryAfter(
+        method=SendMessage(chat_id=123, text="grades"),
+        message="Flood",
+        retry_after=120,
+    )
+    await Monitor(db, None, bot).deliver()
+    assert db.all("SELECT next_attempt FROM outbox")[0][0] == 1120
+    restarted = Monitor(db, None, AsyncMock())
+    with db.conn:
+        db.queue(123, ["new notification during rate limit"])
+    clock[0] = 1119
+    await restarted.deliver()
+    restarted.bot.send_message.assert_not_called()
+    clock[0] = 1120
+    await restarted.deliver()
+    assert restarted.bot.send_message.await_count == 2
+
+
+async def test_permanent_bad_message_does_not_retry_forever(db):
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    with db.conn:
+        db.queue(123, ["bad"])
+        db.queue(123, ["good"])
+    bot = AsyncMock()
+    bot.send_message.side_effect = [
+        TelegramBadRequest(method=SendMessage(chat_id=123, text="bad"), message="invalid HTML"),
+        None,
+    ]
+    monitor = Monitor(db, None, bot)
+    await monitor.deliver()
+    assert [row[0] for row in db.all("SELECT status FROM outbox ORDER BY id")] == ["failed", "sent"]
+    await monitor.deliver()
+    assert bot.send_message.await_count == 2
+
+
+async def test_name_update_preserves_deliverable_table_and_moderation_views(db):
+    with db.conn:
+        db.queue(123, ["grades"], kind="grades")
+        db.queue(123, ["table"], kind="table")
+        db.queue(123, ["moderation"], kind="moderation")
+    db.grant_members([(123, "newusername", "Петров Петр")])
+    bot = AsyncMock()
+    await Monitor(db, None, bot).deliver()
+    assert [call.args[1] for call in bot.send_message.await_args_list] == ["table", "moderation"]
+
+
+async def test_legacy_unauthorized_queue_is_not_delivered(db):
+    with db.conn:
+        db.queue(123, ["grades"])
+    db.execute("DELETE FROM members WHERE id=123")
+    bot = AsyncMock()
+    await Monitor(db, None, bot).deliver()
+    bot.send_message.assert_not_called()
+    assert not db.all("SELECT * FROM outbox")
