@@ -52,6 +52,7 @@ def help_message(interval, contact_username, *, admin=False, name=None, fetched_
             "\n\n<b>Админ</b>\n"
             "/add — добавить таблицу\n"
             "/pending — предложения на проверку\n"
+            "/refresh — обновить кэш и проверить изменения\n"
             "/remove — удалить таблицу"
         )
     contact = contact_username.strip().lstrip("@")
@@ -220,6 +221,27 @@ def create_router(db, monitor, contact_username=""):
             return
         await state.update_data(header=header, columns=columns)
         await message.answer("Настройки сохранил — отправь ссылку")
+
+    @router.message(Command("refresh"))
+    async def refresh(message: Message):
+        if message.from_user.id != db.admin_id():
+            await message.answer("Команда доступна админу")
+            return
+        try:
+            result = await monitor.scan()
+        except Exception:
+            await message.answer("Не удалось обновить кэш")
+            return
+        lines = [bold("Обновление кэша завершено"), f"Обновлено таблиц: {result['updated']}"]
+        if result["failed"]:
+            lines.extend(["", "Не удалось обновить:"])
+            for title in result["failed"]:
+                lines.extend(safe_lines(f"- {title}"))
+        if result["notifications"]:
+            lines.append(f"Уведомлений об изменениях: {result['notifications']}")
+        else:
+            lines.append("Новых изменений нет")
+        await send_view(message, db, lines)
 
     @router.message(Command("pending"))
     async def pending(message: Message):

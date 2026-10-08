@@ -60,6 +60,9 @@ class Monitor:
         self.interval = interval
         self.lock = asyncio.Lock()
         self.delivery_lock = asyncio.Lock()
+        self.scan_lock = asyncio.Lock()
+        self.schedule_changed = asyncio.Event()
+        self.next_refresh = 0.0
 
     async def inspect_user(self, user_id, *, baseline=False):
         """Read persisted cache only; never wait for Google or mutate it on /grades."""
@@ -100,14 +103,27 @@ class Monitor:
             self.session, sheet["url"], sheet["header_row"], json.loads(sheet["name_columns"])
         )
 
-    async def scan(self):
-        fetched = []
+    async def scan(self, *, scheduled=False):
+        async with self.scan_lock:
+            # A manual refresh may have moved the deadline while the scheduler waited.
+            if scheduled and time.monotonic() < self.next_refresh:
+                return None
+            try:
+                return await self._scan()
+            finally:
+                self.next_refresh = time.monotonic() + self.interval
+                self.schedule_changed.set()
+
+    async def _scan(self):
+        fetched, failed = [], []
+        notifications = 0
         # Fetch outside the state lock: cached commands remain immediate during network outages.
         for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
             try:
                 parsed = await self.fetch(sheet)
                 fetched.append((sheet["id"], parsed, time.time()))
             except Exception:
+                failed.append(sheet["title"])
                 log.exception("Failed to refresh sheet %s; preserving cache", sheet["id"])
         async with self.lock:
             with self.db.conn:
@@ -150,7 +166,9 @@ class Monitor:
                         )
                     if len(lines) > 2:
                         self.db.queue(user["id"], lines)
+                        notifications += 1
         await self.deliver()
+        return {"updated": len(fetched), "failed": failed, "notifications": notifications}
 
     async def deliver(self):
         async with self.delivery_lock:
@@ -180,8 +198,16 @@ class Monitor:
     async def run(self, interval):
         self.interval = interval
         while True:
+            self.schedule_changed.clear()
+            delay = max(0, self.next_refresh - time.monotonic())
+            if delay:
+                try:
+                    await asyncio.wait_for(self.schedule_changed.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+                else:
+                    continue
             try:
-                await self.scan()
+                await self.scan(scheduled=True)
             except Exception:
                 log.exception("Monitor iteration failed")
-            await asyncio.sleep(interval)
