@@ -511,7 +511,9 @@ async def test_successful_registration_shows_only_welcome_and_help(dialog_bot):
     await h.send("/start")
     await h.send("Иванов Иван")
     assert h.replies()[-1] == (
-        "<b>Добро пожаловать, Иванов Иван</b>\nПодсказки по управлению можно посмотреть тут — /help"
+        "<b>Добро пожаловать, Иванов Иван</b>\n"
+        "Я буду присылать информацию о новых оценках, как только найду их\n"
+        "Подсказки по управлению можно посмотреть тут — /help"
     )
     assert h.bot.session.await_count == 2
 

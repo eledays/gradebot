@@ -376,6 +376,7 @@ def create_router(db, monitor, contact_username=""):
             reports = await monitor.inspect_user(message.from_user.id, baseline=True)
             lines = [
                 bold(f"Добро пожаловать, {name}"),
+                "Я буду присылать информацию о новых оценках, как только найду их",
                 "Подсказки по управлению можно посмотреть тут — /help",
             ]
             summary = registration_summary(reports)
