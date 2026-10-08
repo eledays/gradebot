@@ -27,6 +27,7 @@ from aiogram.types import (
 
 from .db import DuplicateTitleError
 from .monitor import Monitor, cache_caption, format_grades
+from .network import network_sessions
 from .presentation import bold, safe_lines, send_view, table_link, view_markup
 from .sheets import SheetError, export_url, fetch_sheet, sheet_url, valid_name
 
@@ -863,10 +864,10 @@ def create_router(db, monitor, contact_username=""):
     return router
 
 
-async def run_bot(db, token, interval, contact_username=""):
+async def run_bot(db, token, interval, contact_username="", proxy_url=None):
     if db.admin_id() is None:
         raise ValueError("Назначьте админа: gradebot admin TELEGRAM_ID")
-    async with Bot(token=token) as bot, aiohttp.ClientSession() as session:
+    async with network_sessions(proxy_url) as (telegram, session), Bot(token=token, session=telegram) as bot:
         monitor = Monitor(db, session, bot, interval)
         dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
         dispatcher.include_router(create_router(db, monitor, contact_username))

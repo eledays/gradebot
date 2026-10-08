@@ -7,7 +7,7 @@ name = "group-grade-bot"
 version = "0.1.0"
 description = "Telegram notifications for university Google Sheets grades"
 requires-python = ">=3.11"
-dependencies = ["aiogram>=3.20,<4", "aiohttp>=3.9,<4", "python-dotenv>=1,<2"]
+dependencies = ["aiogram>=3.20,<4", "aiohttp>=3.9,<4", "python-dotenv>=1,<2", "aiohttp-socks>=0.10,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1"]

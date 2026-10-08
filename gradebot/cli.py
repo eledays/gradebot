@@ -37,13 +37,24 @@ def main():
                 parser.error("Set BOT_TOKEN in the environment")
             if db.admin_id() is None:
                 parser.error("Assign an administrator first: gradebot admin TELEGRAM_ID")
+            proxy_url = os.getenv("PROXY_URL", "").strip() or None
+            from .network import ProxyConfigurationError, proxy_options
+
+            try:
+                proxy_options(proxy_url)
+            except ProxyConfigurationError as exc:
+                parser.error(str(exc))
             logging.basicConfig(level=logging.INFO)
             from .bot import run_bot
             from .runtime import AlreadyRunningError, database_run_lock
 
             try:
                 with database_run_lock(args.db):
-                    asyncio.run(run_bot(db, token, args.interval, os.getenv("CONTACT_USERNAME", "")))
+                    asyncio.run(
+                        run_bot(
+                            db, token, args.interval, os.getenv("CONTACT_USERNAME", ""), proxy_url=proxy_url
+                        )
+                    )
             except AlreadyRunningError as exc:
                 parser.error(str(exc))
     finally:
