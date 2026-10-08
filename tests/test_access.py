@@ -1,15 +1,13 @@
 import json
 import sqlite3
 from datetime import UTC, datetime
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import SimpleEventIsolation
-from aiogram.types import CallbackQuery, Chat, Message, SharedUser, Update, User, UsersShared
+from aiogram.types import CallbackQuery, Chat, Contact, Message, SharedUser, Update, User, UsersShared
 
-from gradebot.access import AccessError, UsernameResolver, parse_members
 from gradebot.bot import Dialog, create_router
 from gradebot.db import Database
 from gradebot.monitor import Monitor
@@ -23,15 +21,12 @@ def app(tmp_path):
     db.execute("INSERT INTO settings VALUES('admin','999')")
     bot = Bot("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk")
     bot.session = AsyncMock()
-    resolver = SimpleNamespace(
-        resolve=AsyncMock(side_effect=lambda username: {"ivanov": 123, "petrov": 456}[username])
-    )
     monitor = Monitor(db, None, bot)
     dispatcher = Dispatcher(events_isolation=SimpleEventIsolation())
-    dispatcher.include_router(create_router(db, monitor, "group_admin", resolver))
+    dispatcher.include_router(create_router(db, monitor, "group_admin"))
 
     class App:
-        async def send(self, text=None, user_id=999, username=None, shared=None):
+        async def send(self, text=None, user_id=999, username=None, shared=None, contact=None):
             message = Message(
                 message_id=1,
                 date=datetime.now(UTC),
@@ -39,6 +34,7 @@ def app(tmp_path):
                 from_user=User(id=user_id, is_bot=False, first_name="Test", username=username),
                 text=text,
                 users_shared=shared,
+                contact=contact,
             )
             await dispatcher.feed_update(bot, Update(update_id=1, message=message))
 
@@ -68,12 +64,15 @@ def app(tmp_path):
                 call.args[1].text for call in bot.session.await_args_list if hasattr(call.args[1], "text")
             ]
 
+        async def add_contact(self, user_id=123, name="Иванов Иван"):
+            await self.send(contact=Contact(user_id=user_id, phone_number="+70000000000", first_name="Test"))
+            await self.send(name)
+
         async def confirm(self):
-            data = await self.context().get_data()
-            await self.click(f"grant:{data['token']}")
+            await self.send("Сохранить всех")
 
     instance = App()
-    instance.db, instance.bot, instance.monitor, instance.resolver = db, bot, monitor, resolver
+    instance.db, instance.bot, instance.monitor = db, bot, monitor
     yield instance
     db.close()
 
@@ -89,51 +88,50 @@ async def test_outsider_cannot_read_or_register(app, text):
     assert not app.db.all("SELECT * FROM members")
 
 
-async def test_import_resolves_immediately_and_pins_access_to_id(app):
+async def test_contacts_accumulate_and_access_is_pinned_to_id(app):
     await app.send("/access")
-    await app.send("@IVANOV | Иванов Иван\n@petrov | Петров Петр")
-    assert app.resolver.resolve.await_count == 2
-    assert await app.state() == Dialog.access_confirm.state
-    assert not app.db.all("SELECT * FROM members")
-    assert "ID 123" in app.replies()[-1]
-    await app.confirm()
-    assert len(app.db.all("SELECT * FROM members")) == 2
-    assert not app.db.all("SELECT * FROM users")  # No notifications until first start.
-    await app.send("/start", 123, "newusername")
-    assert "Привет, Иванов Иван!" in app.replies()[-2]
-    await app.send("/start", 777, "ivanov")  # Username now belongs to someone else.
-    assert "Доступ закрыт" in app.replies()[-1]
-    await app.send("/start", 123)  # Removing the username does not revoke access.
-    assert "Привет, Иванов Иван!" in app.replies()[-2]
-
-
-async def test_invalid_batch_saves_nothing(app):
-    app.resolver.resolve.side_effect = [123, AccessError("Не найден")]
-    await app.send("/access")
-    await app.send("@ivanov | Иванов Иван\n@petrov | Петров Петр")
+    await app.add_contact(123, "Иванов Иван")
+    await app.add_contact(456, "Петров Петр")
     assert await app.state() == Dialog.access_input.state
     assert not app.db.all("SELECT * FROM members")
-    assert "Не найден" in app.replies()[-1]
+    await app.confirm()
+    assert len(app.db.all("SELECT * FROM members")) == 2
+    assert not app.db.all("SELECT * FROM users")
+    await app.send("/start", 123, "newusername")
+    assert "Привет, Иванов Иван!" in app.replies()[-2]
+    await app.send("/start", 777, "ivanov")
+    assert "Доступ закрыт" in app.replies()[-1]
+    await app.send("/start", 123)
+    assert "Привет, Иванов Иван!" in app.replies()[-2]
 
 
-async def test_duplicate_resolved_id_rejected(app):
-    app.resolver.resolve.side_effect = [123, 123]
+async def test_cancel_discards_entire_draft(app):
     await app.send("/access")
-    await app.send("@ivanov | Иванов Иван\n@petrov | Петров Петр")
-    assert not app.db.all("SELECT * FROM members")
-    assert "одному аккаунту" in app.replies()[-1]
+    await app.add_contact()
+    await app.send("Отмена")
+    await app.confirm()
+    assert not app.db.authorized(123)
+    assert await app.state() is None
 
 
-async def test_old_or_non_admin_confirmation_cannot_grant(app):
+async def test_repeated_contact_updates_single_draft_row(app):
+    await app.send("/access")
+    await app.add_contact(123, "Иванов Иван")
+    await app.add_contact(123, "Иванов Иван Иванович")
+    await app.confirm()
+    rows = app.db.all("SELECT * FROM members")
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Иванов Иван Иванович"
+
+
+async def test_non_admin_cannot_save_draft(app):
     app.db.grant_members([(456, "petrov", "Петров Петр")])
     await app.send("/access")
-    await app.send("@ivanov | Иванов Иван")
-    data = await app.context().get_data()
-    await app.click(f"grant:{data['token']}", 456)
+    await app.add_contact()
+    await app.send("Сохранить всех", 456)
     assert not app.db.authorized(123)
-    await app.send("/cancel")
-    await app.click(f"grant:{data['token']}")
-    assert not app.db.authorized(123)
+    await app.confirm()
+    assert app.db.authorized(123)
 
 
 async def test_telegram_user_picker_saves_id_before_first_start(app):
@@ -143,7 +141,6 @@ async def test_telegram_user_picker_saves_id_before_first_start(app):
     assert await app.state() == Dialog.member_name.state
     await app.send("Иванов Иван")
     await app.confirm()
-    app.resolver.resolve.assert_not_called()
     assert app.db.authorized(123)
     assert not app.db.all("SELECT * FROM users")
     await app.send("/start", 123)
@@ -266,69 +263,6 @@ def test_legacy_self_registered_users_do_not_receive_access(tmp_path):
         db.close()
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "@ivanov Иванов Иван",
-        "@ivanov | Иванов",
-        "@ivanov | Иванов Иван\n@IVANOV | Петров Петр",
-        "",
-        "bad user | Иванов Иван",
-    ],
-)
-def test_roster_validation(text):
-    with pytest.raises(AccessError):
-        parse_members(text)
-
-
-async def test_resolver_requires_configuration(monkeypatch):
-    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)
-    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
-    with pytest.raises(AccessError, match="Выбери человека"):
-        await UsernameResolver("fake-token").resolve("ivanov")
-
-
-async def test_resolver_uses_fresh_telegram_lookup_not_username_cache(monkeypatch):
-    telethon = pytest.importorskip("telethon")
-    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
-    monkeypatch.setenv("TELEGRAM_API_HASH", "fake-hash")
-    resolver = UsernameResolver("fake-token")
-    client = AsyncMock()
-    client.is_connected = lambda: True
-    client.is_user_authorized.return_value = True
-    client.side_effect = [
-        SimpleNamespace(peer=telethon.types.PeerUser(123), users=[telethon.types.User(id=123)]),
-        SimpleNamespace(peer=telethon.types.PeerUser(456), users=[telethon.types.User(id=456)]),
-    ]
-    resolver.client = client
-    assert await resolver.resolve("ivanov") == 123
-    assert await resolver.resolve("ivanov") == 456
-    assert client.await_count == 2
-    assert all(call.args[0].__class__.__name__ == "ResolveUsernameRequest" for call in client.await_args_list)
-    await resolver.close()
-    client.disconnect.assert_awaited_once()
-
-
-@pytest.mark.parametrize("kind", ["bot", "channel", "deleted", "missing"])
-async def test_resolver_rejects_non_users(monkeypatch, kind):
-    telethon = pytest.importorskip("telethon")
-    monkeypatch.setenv("TELEGRAM_API_ID", "12345")
-    monkeypatch.setenv("TELEGRAM_API_HASH", "fake-hash")
-    resolver = UsernameResolver("fake-token")
-    client = AsyncMock()
-    client.is_connected = lambda: True
-    client.is_user_authorized.return_value = True
-    client.return_value = SimpleNamespace(
-        peer=telethon.types.PeerChannel(123) if kind == "channel" else telethon.types.PeerUser(123),
-        users=[]
-        if kind == "missing"
-        else [telethon.types.User(id=123, bot=kind == "bot", deleted=kind == "deleted")],
-    )
-    resolver.client = client
-    with pytest.raises(AccessError):
-        await resolver.resolve("ivanov")
-
-
 async def test_admin_can_delete_table_by_button_with_confirmation(app):
     sheet_id = app.db.add_sheet(
         "Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved"
@@ -357,3 +291,102 @@ async def test_admin_can_revoke_by_button_and_outsider_cannot(app):
     data = await app.context().get_data()
     await app.click(f"revoke:{data['token']}")
     assert not app.db.authorized(123)
+
+
+async def test_username_import_is_not_supported(app):
+    await app.send("/access")
+    await app.send("@ivanov | Иванов Иван")
+    assert app.replies()[-1] == "Отправь контакт"
+    assert not app.db.all("SELECT * FROM members")
+
+
+async def test_contact_without_id_preserves_draft(app):
+    await app.send("/access")
+    await app.add_contact()
+    await app.send(contact=Contact(phone_number="+70000000000", first_name="Unknown"))
+    assert app.replies()[-1] == "В контакте нет Telegram ID"
+    assert len((await app.context().get_data())["entries"]) == 1
+    await app.confirm()
+    assert app.db.authorized(123)
+
+
+async def test_second_contact_does_not_overwrite_unfinished_name(app):
+    await app.send("/access")
+    await app.send(contact=Contact(user_id=123, phone_number="+70000000000", first_name="First"))
+    await app.send(contact=Contact(user_id=456, phone_number="+70000000001", first_name="Second"))
+    assert app.replies()[-1] == "Контактов в очереди: 2"
+    await app.send("Иванов Иван")
+    assert await app.state() == Dialog.member_name.state
+    await app.send("Петров Петр")
+    await app.confirm()
+    assert app.db.authorized(123)
+    assert app.db.authorized(456)
+
+
+async def test_save_does_not_drop_unfinished_contact(app):
+    await app.send("/access")
+    await app.add_contact()
+    await app.send(contact=Contact(user_id=456, phone_number="+70000000000", first_name="Test"))
+    await app.confirm()
+    assert app.replies()[-1] == "Сначала отправь ФИО"
+    assert not app.db.all("SELECT * FROM members")
+    await app.send("Петров Петр")
+    await app.confirm()
+    assert len(app.db.all("SELECT * FROM members")) == 2
+
+
+async def test_invalid_name_keeps_contact_and_draft(app):
+    await app.send("/access")
+    await app.add_contact()
+    await app.send(contact=Contact(user_id=456, phone_number="+70000000000", first_name="Test"))
+    await app.send("Петр")
+    assert await app.state() == Dialog.member_name.state
+    await app.send("Петров Петр")
+    await app.confirm()
+    assert len(app.db.all("SELECT * FROM members")) == 2
+
+
+async def test_contact_from_non_admin_is_not_added(app):
+    app.db.grant_members([(456, "", "Петров Петр")])
+    await app.send("/access")
+    await app.send(contact=Contact(user_id=123, phone_number="+70000000000", first_name="Test"), user_id=456)
+    assert not app.db.authorized(123)
+    assert not (await app.context().get_data())["entries"]
+
+
+async def test_contacts_can_arrive_as_batch_before_names(app):
+    await app.send("/access")
+    for user_id in (123, 456, 789):
+        await app.send(
+            contact=Contact(user_id=user_id, phone_number="+70000000000", first_name=f"User{user_id}")
+        )
+    assert not app.db.all("SELECT * FROM members")
+    assert len((await app.context().get_data())["queue"]) == 2
+    for name in ("Иванов Иван", "Петров Петр", "Сидоров Сидор"):
+        await app.send(name)
+    assert await app.state() == Dialog.access_input.state
+    await app.confirm()
+    assert [(row["id"], row["name"]) for row in app.db.all("SELECT * FROM members ORDER BY id")] == [
+        (123, "Иванов Иван"),
+        (456, "Петров Петр"),
+        (789, "Сидоров Сидор"),
+    ]
+
+
+async def test_duplicate_queued_contact_does_not_request_name_twice(app):
+    await app.send("/access")
+    for user_id in (123, 456, 456):
+        await app.send(contact=Contact(user_id=user_id, phone_number="+70000000000", first_name="User"))
+    assert app.replies()[-1] == "Контакт уже в очереди"
+    await app.send("Иванов Иван")
+    await app.send("Петров Петр")
+    await app.confirm()
+    assert len(app.db.all("SELECT * FROM members")) == 2
+
+
+async def test_empty_list_is_not_saved(app):
+    await app.send("/access")
+    await app.confirm()
+    assert app.replies()[-1] == "Список пуст"
+    assert await app.state() == Dialog.access_input.state
+    assert not app.db.all("SELECT * FROM members")

@@ -25,7 +25,6 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from .access import AccessError, UsernameResolver, parse_members
 from .db import DuplicateTitleError
 from .monitor import Monitor, cache_caption, format_grades
 from .presentation import bold, safe_lines, send_view, table_link, view_markup
@@ -78,7 +77,6 @@ def help_message(interval, contact_username, *, admin=False, name=None, fetched_
 class Dialog(StatesGroup):
     access_input = State()
     member_name = State()
-    access_confirm = State()
     revoke = State()
     revoke_confirm = State()
     remove_confirm = State()
@@ -157,7 +155,7 @@ class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = event.from_user
         if not user or not self.db.authorized(user.id):
-            text = "Доступ закрыт. Попроси администратора добавить тебя в список группы."
+            text = "Доступ закрыт"
             if self.contact:
                 text += f"\nДля связи: @{self.contact}"
             if isinstance(event, CallbackQuery):
@@ -173,7 +171,7 @@ class AccessMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
-def create_router(db, monitor, contact_username="", resolver=None):
+def create_router(db, monitor, contact_username=""):
     router = Router()
     guard = AccessMiddleware(db, contact_username)
     router.message.outer_middleware(guard)
@@ -207,21 +205,18 @@ def create_router(db, monitor, contact_username="", resolver=None):
         first = not registered(user_id)
         if not db.activate(user_id):
             await message.answer(
-                "Панель администратора. Добавь пользователей, затем таблицы с оценками.\n"
-                "Чтобы получать свои оценки, добавь себя в список пользователей.",
+                "Панель администратора",
                 reply_markup=menu(True),
             )
             return
         name = db.all("SELECT name FROM members WHERE id=?", (user_id,))[0]["name"]
         reports = await monitor.inspect_user(user_id, baseline=first)
         await message.answer(
-            f"Привет, {name}!\nДоступ открыт. Здесь твои оценки и уведомления об изменениях.",
+            f"Привет, {name}!\nОценки и уведомления",
             reply_markup=menu(user_id == db.admin_id()),
         )
         summary = registration_summary(reports)
         lines = safe_lines(summary) if summary else []
-        if any(report["status"] in {"missing", "ambiguous"} for report in reports):
-            lines.extend(safe_lines("Если ФИО указано неверно, обратись к администратору."))
         for report in reports:
             if report["stale"] and report["fetched_at"] is not None:
                 lines.append(cache_caption(report) + " " + escape(report["title"]))
@@ -240,7 +235,7 @@ def create_router(db, monitor, contact_username="", resolver=None):
 
     @router.message(Command("name"))
     async def name_command(message: Message):
-        await message.answer("ФИО задаёт администратор. Обратись к нему, если нужна правка.")
+        await message.answer("ФИО меняет администратор")
 
     @router.message(F.text == "Уведомления")
     @router.message(Command("notifications"))
@@ -250,7 +245,7 @@ def create_router(db, monitor, contact_username="", resolver=None):
             return
         enabled = db.toggle_notifications(message.from_user.id)
         await message.answer(
-            "Уведомления включены" if enabled else "Уведомления выключены. Оценки по-прежнему доступны.",
+            "Уведомления включены" if enabled else "Уведомления выключены",
             reply_markup=menu(message.from_user.id == db.admin_id()),
         )
 
@@ -503,20 +498,33 @@ def create_router(db, monitor, contact_username="", resolver=None):
                 actions[anchor] = [(f"Закрыть доступ #{row['id']}", f"pick_revoke:{row['id']}")]
             lines.append("Вход выполнен" if row["active"] else "Ещё не заходил")
             lines.append("")
-        lines.extend(
-            [
-                "Добавить или исправить ФИО: /access",
-                "Закрыть доступ: /revoke",
-                "Юзернейм показан на момент добавления. Доступ определяется по ID.",
-            ]
-        )
         await send_view(
             message,
             db,
-            lines if rows else ["Список пуст. Добавь пользователей через /access"],
+            lines if rows else ["Список пуст"],
             admin=True,
             actions=actions,
         )
+
+    def access_keyboard(request_id, count=0):
+        rows = [
+            [
+                KeyboardButton(
+                    text="Выбрать пользователя",
+                    request_users=KeyboardButtonRequestUsers(
+                        request_id=request_id,
+                        user_is_bot=False,
+                        max_quantity=1,
+                        request_username=True,
+                        request_name=True,
+                    ),
+                )
+            ]
+        ]
+        if count:
+            rows.append([KeyboardButton(text="Сохранить всех")])
+        rows.append([KeyboardButton(text="Отмена")])
+        return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
     @router.message(F.text == "Добавить пользователей")
     @router.message(Command("access"))
@@ -526,76 +534,106 @@ def create_router(db, monitor, contact_username="", resolver=None):
             return
         await state.clear()
         request_id = secrets.randbelow(2**30)
-        await state.update_data(request_id=request_id)
+        await state.update_data(request_id=request_id, entries=[], queue=[])
         await state.set_state(Dialog.access_input)
+        await message.answer("Отправь контакт", reply_markup=access_keyboard(request_id))
+
+    async def request_member_name(message, state, member_id, username="", label=""):
+        data = await state.get_data()
+        queue = data.get("queue", [])
+        ids = {entry[0] for entry in data.get("entries", [])} | {entry[0] for entry in queue}
+        if await state.get_state() == Dialog.member_name.state:
+            ids.add(data["member_id"])
+        if len(ids) >= 50 and member_id not in ids:
+            await message.answer("В списке уже 50 пользователей")
+            return
+        if await state.get_state() == Dialog.member_name.state:
+            if member_id == data["member_id"] or any(entry[0] == member_id for entry in queue):
+                await message.answer("Контакт уже в очереди")
+                return
+            queue.append((member_id, username, label))
+            await state.update_data(queue=queue)
+            await message.answer(f"Контактов в очереди: {len(queue) + 1}")
+            return
+        await state.update_data(member_id=member_id, username=username, member_label=label)
+        await state.set_state(Dialog.member_name)
         await message.answer(
-            "Выбери пользователя кнопкой ниже, затем укажи его ФИО.\n\n"
-            "Или отправь список (до 50 строк):\n@username | Иванов Иван Иванович\n\n"
-            "ID определится сразу. Пользователь не вводит ФИО и не обязан заходить заранее.\n"
-            "Чтобы исправить ФИО, добавь того же человека с новым именем. Отмена — /cancel.",
+            f"ФИО — {label}" if label else "ФИО",
             reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [
-                        KeyboardButton(
-                            text="Выбрать пользователя",
-                            request_users=KeyboardButtonRequestUsers(
-                                request_id=request_id,
-                                user_is_bot=False,
-                                max_quantity=1,
-                                request_username=True,
-                            ),
-                        ),
-                        KeyboardButton(text="/cancel"),
-                    ]
-                ],
+                keyboard=[[KeyboardButton(text="Отмена")]],
                 resize_keyboard=True,
-                one_time_keyboard=True,
             ),
         )
 
-    async def preview_members(message, state, entries):
-        token = secrets.token_hex(8)
-        await state.update_data(entries=entries, token=token)
-        await state.set_state(Dialog.access_confirm)
-        await message.answer("ID проверены. Проверь ФИО и сохрани список.", reply_markup=menu(True))
-        lines = [bold("Открыть доступ этим пользователям?"), ""]
-        for user_id, username, name in entries:
-            old = db.all("SELECT name FROM members WHERE id=?", (user_id,))
-            label = f"@{username}" if username else "без юзернейма"
-            lines.extend(safe_lines(f"{name} · {label} · ID {user_id}"))
-            if old:
-                lines.extend(safe_lines(f"Уже в списке: {old[0]['name']} → {name}"))
-            lines.append("")
-        await send_view(
+    @router.message(Dialog.access_input, F.contact)
+    @router.message(Dialog.member_name, F.contact)
+    async def contact_member(message: Message, state: FSMContext):
+        if message.from_user.id != db.admin_id():
+            await state.clear()
+            return
+        if not message.contact.user_id or message.contact.user_id <= 0:
+            data = await state.get_data()
+            await message.answer(
+                "В контакте нет Telegram ID",
+                reply_markup=access_keyboard(
+                    data["request_id"],
+                    len(data.get("entries", [])),
+                ),
+            )
+            return
+        await request_member_name(
             message,
-            db,
-            lines,
-            admin=True,
-            actions=[
-                [
-                    ("Сохранить", f"grant:{token}"),
-                    ("Отмена", f"dismiss:{token}"),
-                ]
-            ],
+            state,
+            message.contact.user_id,
+            label=" ".join(part for part in (message.contact.first_name, message.contact.last_name) if part),
         )
 
     @router.message(Dialog.access_input, F.users_shared)
+    @router.message(Dialog.member_name, F.users_shared)
     async def selected_user(message: Message, state: FSMContext):
         data = await state.get_data()
         shared = message.users_shared
         if message.from_user.id != db.admin_id() or shared.request_id != data.get("request_id"):
-            await message.answer("Выбор устарел. Начни заново через /access")
+            await message.answer("Выбор устарел")
             return
         if len(shared.users) != 1 or shared.users[0].user_id <= 0:
             await message.answer("Выбери одного пользователя")
             return
         user = shared.users[0]
-        await state.update_data(member_id=user.user_id, username=(user.username or "").lower())
-        await state.set_state(Dialog.member_name)
-        await message.answer(
-            "Отправь ФИО этого пользователя, как в таблицах с оценками (2–3 полных слова)",
-            reply_markup=ReplyKeyboardRemove(),
+        await request_member_name(
+            message,
+            state,
+            user.user_id,
+            (user.username or "").lower(),
+            " ".join(part for part in (user.first_name, user.last_name) if part),
         )
+
+    @router.message(F.text == "Сохранить всех")
+    @router.message(Command("save"))
+    async def save_members(message: Message, state: FSMContext):
+        if message.from_user.id != db.admin_id():
+            await message.answer("Команда доступна админу")
+            return
+        current = await state.get_state()
+        if current != Dialog.access_input.state:
+            await message.answer(
+                "Сначала отправь ФИО"
+                if current == Dialog.member_name.state
+                else "Начни добавление пользователей"
+            )
+            return
+        entries = (await state.get_data()).get("entries", [])
+        if not entries:
+            await message.answer("Список пуст")
+            return
+        async with monitor.lock:
+            db.grant_members(entries)
+        await state.clear()
+        await message.answer(f"Сохранил пользователей: {len(entries)}", reply_markup=menu(True))
+
+    @router.message(F.text == "Отмена")
+    async def cancel_button(message: Message, state: FSMContext):
+        await cancel(message, state)
 
     @router.message(Dialog.member_name, F.text, ~F.text.startswith("/"))
     async def selected_name(message: Message, state: FSMContext):
@@ -604,35 +642,32 @@ def create_router(db, monitor, contact_username="", resolver=None):
             return
         name = " ".join(message.text.split())
         if not valid_name(name):
-            await message.answer("Нужно ФИО из 2–3 полных слов, как в таблице с оценками")
+            await message.answer("Нужно 2–3 полных слова")
             return
         data = await state.get_data()
-        await preview_members(message, state, [(data["member_id"], data["username"], name)])
+        entries = [entry for entry in data.get("entries", []) if entry[0] != data["member_id"]]
+        entries.append((data["member_id"], data["username"], name))
+        queue = data.get("queue", [])
+        await state.update_data(entries=entries)
+        if queue:
+            member_id, username, label = queue.pop(0)
+            await state.update_data(queue=queue, member_id=member_id, username=username, member_label=label)
+            await message.answer(
+                f"{name} · В списке: {len(entries)}\n" + (f"ФИО — {label}" if label else "ФИО")
+            )
+        else:
+            await state.set_state(Dialog.access_input)
+            await message.answer(
+                f"{name} · В списке: {len(entries)}",
+                reply_markup=access_keyboard(
+                    data["request_id"],
+                    len(entries),
+                ),
+            )
 
     @router.message(Dialog.access_input, F.text, ~F.text.startswith("/"))
-    async def import_members(message: Message, state: FSMContext):
-        if message.from_user.id != db.admin_id():
-            await state.clear()
-            return
-        try:
-            parsed = parse_members(message.text)
-            if resolver is None:
-                raise AccessError("Поиск по @username не настроен. Используй кнопку «Выбрать пользователя».")
-            await message.answer("Проверяю юзернеймы в Telegram…")
-            entries, seen = [], set()
-            async with asyncio.timeout(90):
-                for username, name in parsed:
-                    user_id = await resolver.resolve(username)
-                    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
-                        raise AccessError(f"Не удалось получить ID @{username}. Список не сохранён.")
-                    if user_id in seen:
-                        raise AccessError("Два юзернейма относятся к одному аккаунту. Оставь одну строку.")
-                    seen.add(user_id)
-                    entries.append((user_id, username, name))
-        except (AccessError, TimeoutError) as exc:
-            await message.answer(str(exc) or "Проверка заняла слишком много времени. Список не сохранён.")
-            return
-        await preview_members(message, state, entries)
+    async def expect_contact(message: Message):
+        await message.answer("Отправь контакт")
 
     @router.message(F.text == "Закрыть доступ")
     @router.message(Command("revoke"))
@@ -667,11 +702,11 @@ def create_router(db, monitor, contact_username="", resolver=None):
         await state.update_data(member_id=user_id, token=token)
         await state.set_state(Dialog.revoke_confirm)
         await message.answer(
-            f"Закрыть доступ для {rows[0]['name']}? Регистрация и сохранённые личные сообщения в БД будут удалены.",
+            f"Закрыть доступ для {rows[0]['name']}?",
             reply_markup=confirmation("revoke", token, "Закрыть доступ"),
         )
 
-    @router.callback_query(F.data.regexp(r"^(grant|remove|revoke|dismiss):[a-f0-9]{16}$"))
+    @router.callback_query(F.data.regexp(r"^(remove|revoke|dismiss):[a-f0-9]{16}$"))
     async def confirm(callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id != db.admin_id():
             await callback.answer("Только для админа", show_alert=True)
@@ -679,22 +714,18 @@ def create_router(db, monitor, contact_username="", resolver=None):
         action, token = callback.data.split(":")
         data = await state.get_data()
         states = {
-            "grant": Dialog.access_confirm.state,
             "remove": Dialog.remove_confirm.state,
             "revoke": Dialog.revoke_confirm.state,
         }
         current = await state.get_state()
         if data.get("token") != token or (action != "dismiss" and states[action] != current):
-            await callback.answer("Подтверждение устарело. Начни действие заново.", show_alert=True)
+            await callback.answer("Подтверждение устарело", show_alert=True)
             return
         if action == "dismiss":
             result = "Отменил"
         else:
             async with monitor.lock:
-                if action == "grant":
-                    db.grant_members(data["entries"])
-                    result = f"Сохранил пользователей: {len(data['entries'])}. Теперь им достаточно открыть /start."
-                elif action == "remove":
+                if action == "remove":
                     deleted = db.execute(
                         "DELETE FROM sheets WHERE id=? AND status='approved'", (data["sheet_id"],)
                     )
@@ -724,10 +755,7 @@ def create_router(db, monitor, contact_username="", resolver=None):
             return
         await state.update_data(title=title)
         await state.set_state(Dialog.link)
-        await message.answer(
-            "Отправь ссылку на таблицу.\nПо умолчанию: заголовки в строке 1, ФИО в столбце A. "
-            "Если иначе — /layout 3 | 2. Отмена — /cancel."
-        )
+        await message.answer("Отправь ссылку на таблицу")
 
     @router.message(Dialog.link, F.text, ~F.text.startswith("/"))
     async def save_link(message: Message, state: FSMContext):
@@ -743,7 +771,7 @@ def create_router(db, monitor, contact_username="", resolver=None):
             parsed = await fetch_sheet(monitor.session, url, data["header"], data["columns"])
             if not db.authorized(message.from_user.id) or (direct and message.from_user.id != db.admin_id()):
                 await state.clear()
-                await message.answer("Доступ изменился. Таблица не сохранена.")
+                await message.answer("Доступ изменился")
                 return
             db.add_sheet(
                 data["title"],
@@ -756,10 +784,7 @@ def create_router(db, monitor, contact_username="", resolver=None):
                 notify=True,
             )
         except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError):
-            await message.answer(
-                "Не удалось прочитать таблицу. Проверь ссылку и доступ на чтение без входа "
-                "в Google. Затем отправь ссылку ещё раз; отмена — /cancel."
-            )
+            await message.answer("Не удалось прочитать таблицу")
             return
         except DuplicateTitleError:
             await state.set_state(Dialog.title)
@@ -791,13 +816,13 @@ def create_router(db, monitor, contact_username="", resolver=None):
     async def ask_remove(message, state, sheet_id):
         rows = db.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
         if not rows:
-            await message.answer("Таблица с таким номером не найдена. Посмотри номера в /tables.")
+            await message.answer("Таблица не найдена")
             return
         token = secrets.token_hex(8)
         await state.update_data(sheet_id=sheet_id, token=token)
         await state.set_state(Dialog.remove_confirm)
         await message.answer(
-            f"Удалить таблицу «{rows[0]['title']}»? Её кэш и история сравнения будут удалены.",
+            f"Удалить таблицу «{rows[0]['title']}»?",
             reply_markup=confirmation("remove", token, "Удалить"),
         )
 
@@ -823,12 +848,11 @@ def create_router(db, monitor, contact_username="", resolver=None):
             Dialog.title.state: "Жду название предмета",
             Dialog.link.state: "Жду ссылку на таблицу",
             Dialog.remove.state: "Жду номер таблицы",
-            Dialog.access_input.state: "Отправь строки @username | ФИО или выбери пользователя кнопкой",
+            Dialog.access_input.state: "Отправь контакт",
             Dialog.member_name.state: "Отправь ФИО выбранного пользователя",
-            Dialog.access_confirm.state: "Проверь список выше и нажми «Сохранить». Отмена — /cancel",
-            Dialog.remove_confirm.state: "Подтверди удаление кнопкой выше. Отмена — /cancel",
+            Dialog.remove_confirm.state: "Жду подтверждение",
             Dialog.revoke.state: "Отправь ID пользователя из /members",
-            Dialog.revoke_confirm.state: "Подтверди закрытие доступа кнопкой выше. Отмена — /cancel",
+            Dialog.revoke_confirm.state: "Жду подтверждение",
         }
         await message.answer(prompts.get(current, help_text(message.from_user.id)), parse_mode="HTML")
 
@@ -842,11 +866,10 @@ def create_router(db, monitor, contact_username="", resolver=None):
 async def run_bot(db, token, interval, contact_username=""):
     if db.admin_id() is None:
         raise ValueError("Назначьте админа: gradebot admin TELEGRAM_ID")
-    resolver = UsernameResolver(token)
     async with Bot(token=token) as bot, aiohttp.ClientSession() as session:
         monitor = Monitor(db, session, bot, interval)
         dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
-        dispatcher.include_router(create_router(db, monitor, contact_username, resolver))
+        dispatcher.include_router(create_router(db, monitor, contact_username))
         task = asyncio.create_task(monitor.run(interval))
         delivery = asyncio.create_task(monitor.run_delivery())
         try:
@@ -857,4 +880,3 @@ async def run_bot(db, token, interval, contact_username=""):
             for background in (task, delivery):
                 with contextlib.suppress(asyncio.CancelledError):
                     await background
-            await resolver.close()
