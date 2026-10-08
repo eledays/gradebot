@@ -554,3 +554,62 @@ async def test_refresh_is_admin_only_and_reports_failures(dialog_bot):
     assert "Уведомлений об изменениях: 1" in h.replies()[-1]
     await h.send("/help", 999)
     assert "/refresh" in h.replies()[-1]
+
+
+async def test_refresh_acknowledges_before_network_work(dialog_bot):
+    h = dialog_bot
+
+    async def scan():
+        assert h.replies()[-1] == "Секундочку"
+        return {"updated": 1, "failed": [], "notifications": 0}
+
+    h.monitor.scan = AsyncMock(side_effect=scan)
+    await h.send("/refresh", 999)
+    assert h.replies()[0] == "Секундочку"
+    assert "Обновление кэша завершено" in h.replies()[-1]
+
+
+async def test_table_link_acknowledges_before_fetch_and_error(dialog_bot, monkeypatch):
+    h = dialog_bot
+    h.db.register(999, "Иванов Иван")
+
+    async def fetch(*args):
+        assert h.replies()[-1] == "Секундочку"
+        raise SheetError("Google unavailable")
+
+    monkeypatch.setattr("gradebot.bot.fetch_sheet", fetch)
+    await h.send("/add", 999)
+    await h.send("История", 999)
+    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    assert h.replies()[-2] == "Секундочку"
+    assert "Не получилось спарсить" in h.replies()[-1]
+
+
+async def test_approval_acknowledges_before_fetch(dialog_bot):
+    from aiogram.types import CallbackQuery
+
+    h = dialog_bot
+    sheet_id = h.db.add_sheet(
+        "ОРГ", "https://docs.google.com/spreadsheets/d/org/edit", 1, (1,), 123, "pending"
+    )
+
+    async def fetch(sheet):
+        assert h.replies()[-1] == "Секундочку"
+        return Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]])
+
+    h.monitor.fetch = AsyncMock(side_effect=fetch)
+    dispatcher = Dispatcher()
+    dispatcher.include_router(create_router(h.db, h.monitor))
+    message = Message(
+        message_id=1, date=datetime.now(UTC), chat=Chat(id=999, type="private"), text="Предложение"
+    )
+    callback = CallbackQuery(
+        id="approve",
+        from_user=User(id=999, is_bot=False, first_name="Admin"),
+        chat_instance="instance",
+        message=message,
+        data=f"approve:{sheet_id}",
+    )
+    await dispatcher.feed_update(h.bot, Update(update_id=1, callback_query=callback))
+    assert h.replies()[0] == "Секундочку"
+    assert "Таблица одобрена" in h.replies()
