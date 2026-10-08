@@ -36,7 +36,7 @@ def test_cli_loads_env_and_respects_override_priority(
     from gradebot.cli import main
 
     monkeypatch.chdir(tmp_path)
-    for name in ["BOT_TOKEN", "DATABASE_PATH", "POLL_INTERVAL", "CONTACT_USERNAME"]:
+    for name in ["BOT_TOKEN", "DATABASE_PATH", "POLL_INTERVAL", "CONTACT_USERNAME", "PROXY_URL"]:
         monkeypatch.delenv(name, raising=False)
     (tmp_path / ".env").write_text(
         "BOT_TOKEN=fake-token\nDATABASE_PATH=group.sqlite3\nPOLL_INTERVAL=60\nCONTACT_USERNAME=group_admin\n"
@@ -52,7 +52,7 @@ def test_cli_loads_env_and_respects_override_priority(
     monkeypatch.setattr(sys, "argv", arguments)
     calls = []
 
-    async def fake_run(db, token, interval, contact):
+    async def fake_run(db, token, interval, contact, proxy_url=None):
         calls.append((db.admin_id(), token, interval, contact))
 
     monkeypatch.setattr("gradebot.bot.run_bot", fake_run)
@@ -69,3 +69,26 @@ def test_second_process_cannot_run_on_same_database(tmp_path):
             pytest.fail("A competing runner must not obtain the database lock")
     with database_run_lock(path):
         pass  # The first process released its lock.
+
+
+def test_cli_passes_proxy_from_dotenv(tmp_path, monkeypatch):
+    from gradebot.cli import main
+
+    monkeypatch.chdir(tmp_path)
+    for name in ["BOT_TOKEN", "DATABASE_PATH", "POLL_INTERVAL", "CONTACT_USERNAME", "PROXY_URL"]:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        "BOT_TOKEN=fake-token\nDATABASE_PATH=group.sqlite3\nPROXY_URL=socks5://127.0.0.1:1080\n"
+    )
+    db = Database(str(tmp_path / "group.sqlite3"))
+    db.execute("INSERT INTO settings VALUES('admin','999')")
+    db.close()
+    calls = []
+
+    async def fake_run(db, token, interval, contact, proxy_url=None):
+        calls.append(proxy_url)
+
+    monkeypatch.setattr("gradebot.bot.run_bot", fake_run)
+    monkeypatch.setattr(sys, "argv", ["gradebot", "run"])
+    main()
+    assert calls == ["socks5://127.0.0.1:1080"]
