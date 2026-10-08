@@ -227,6 +227,7 @@ def create_router(db, monitor, contact_username=""):
         if message.from_user.id != db.admin_id():
             await message.answer("Команда доступна админу")
             return
+        await message.answer("Секундочку")
         try:
             result = await monitor.scan()
         except Exception:
@@ -305,16 +306,23 @@ def create_router(db, monitor, contact_username=""):
             return
         parsed = None
         if action == "approve":
+            await callback.answer("Секундочку")
+            if isinstance(callback.message, Message):
+                await callback.message.answer("Секундочку")
             try:
                 parsed = await monitor.fetch(row[0])
             except Exception:
-                await callback.answer("Таблица недоступна или формат неверен", show_alert=True)
+                if isinstance(callback.message, Message):
+                    await callback.message.answer("Таблица недоступна или формат неверен")
                 return
         async with monitor.lock:
             with db.conn:
                 current = db.all("SELECT * FROM sheets WHERE id=? AND status='pending'", (int(sheet_id),))
                 if not current:
-                    await callback.answer("Уже обработано")
+                    if action == "approve" and isinstance(callback.message, Message):
+                        await callback.message.answer("Уже обработано")
+                    elif action != "approve":
+                        await callback.answer("Уже обработано")
                     return
                 sheet = current[0]
                 if action == "approve":
@@ -332,7 +340,11 @@ def create_router(db, monitor, contact_username=""):
                     ],
                     kind="moderation",
                 )
-        await callback.answer("Принято" if action == "approve" else "Отклонено")
+        if action == "approve":
+            if isinstance(callback.message, Message):
+                await callback.message.answer("Таблица одобрена")
+        else:
+            await callback.answer("Отклонено")
         if isinstance(callback.message, Message) and callback.message.reply_markup:
             remaining = [
                 [
@@ -417,6 +429,7 @@ def create_router(db, monitor, contact_username=""):
             return
         try:
             url = sheet_url(message.text.strip())
+            await message.answer("Секундочку")
             parsed = await fetch_sheet(monitor.session, url, data["header"], data["columns"])
             db.add_sheet(
                 data["title"],
