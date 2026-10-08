@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import secrets
 import sqlite3
 import time
@@ -26,6 +27,7 @@ from aiogram.types import (
 )
 
 from .db import DuplicateTitleError
+from .logging_setup import audit
 from .monitor import Monitor, cache_caption, format_grades
 from .network import network_sessions
 from .presentation import bold, safe_lines, send_view, table_link, view_markup
@@ -156,6 +158,7 @@ class AccessMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         user = event.from_user
         if not user or not self.db.authorized(user.id):
+            audit("access_denied", level=logging.DEBUG)
             text = "Доступ закрыт"
             if self.contact:
                 text += f"\nДля связи: @{self.contact}"
@@ -169,7 +172,11 @@ class AccessMiddleware(BaseMiddleware):
             if event.message.chat.type != "private":
                 await event.answer("Открой личный чат с ботом", show_alert=True)
                 return
-        return await handler(event, data)
+        try:
+            return await handler(event, data)
+        except Exception as exc:
+            audit("handler_failed", level=logging.ERROR, error=exc)
+            raise
 
 
 def create_router(db, monitor, contact_username=""):
@@ -409,7 +416,8 @@ def create_router(db, monitor, contact_username=""):
                 await callback.message.answer("Секундочку")
             try:
                 parsed = await monitor.fetch(row[0])
-            except Exception:
+            except Exception as exc:
+                audit("moderation_failed", level=logging.WARNING, sheet_id=int(sheet_id), error=exc)
                 if isinstance(callback.message, Message):
                     await callback.message.answer("Таблица недоступна или формат неверен")
                 return
@@ -442,6 +450,11 @@ def create_router(db, monitor, contact_username=""):
                     ],
                     kind="moderation",
                 )
+        audit(
+            "moderation_finished",
+            sheet_id=int(sheet_id),
+            result="approved" if action == "approve" else "rejected",
+        )
         if action == "approve":
             if isinstance(callback.message, Message):
                 await callback.message.answer("Таблица одобрена")
@@ -731,6 +744,7 @@ def create_router(db, monitor, contact_username=""):
                         "DELETE FROM sheets WHERE id=? AND status='approved'", (data["sheet_id"],)
                     )
                     result = "Таблица удалена" if deleted.rowcount else "Таблица уже удалена"
+                    audit("sheet_removed", sheet_id=data["sheet_id"], count=deleted.rowcount)
                 else:
                     if data["member_id"] == db.admin_id():
                         await callback.answer("Нельзя закрыть доступ текущему админу", show_alert=True)
@@ -784,7 +798,8 @@ def create_router(db, monitor, contact_username=""):
                 parsed=parsed,
                 notify=True,
             )
-        except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError):
+        except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
+            audit("sheet_input_failed", level=logging.WARNING, error=exc)
             await message.answer("Не удалось прочитать таблицу")
             return
         except DuplicateTitleError:

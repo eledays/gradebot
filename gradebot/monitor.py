@@ -10,10 +10,9 @@ from zoneinfo import ZoneInfo
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import LinkPreviewOptions
 
+from .logging_setup import audit
 from .presentation import bold, safe_lines, table_link, view_markup
 from .sheets import Sheet, fetch_sheet
-
-log = logging.getLogger(__name__)
 
 
 def cache_caption(report, label="Последнее обновление"):
@@ -110,8 +109,21 @@ class Monitor:
             # A manual refresh may have moved the deadline while the scheduler waited.
             if scheduled and time.monotonic() < self.next_refresh:
                 return None
+            started = time.monotonic()
+            audit("refresh_started", mode="scheduled" if scheduled else "manual")
             try:
-                return await self._scan()
+                result = await self._scan()
+                audit(
+                    "refresh_finished",
+                    updated=result["updated"],
+                    failed=len(result["failed"]),
+                    notifications=result["notifications"],
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                )
+                return result
+            except Exception as exc:
+                audit("refresh_failed", level=logging.ERROR, error=exc)
+                raise
             finally:
                 self.next_refresh = time.monotonic() + self.interval
                 self.schedule_changed.set()
@@ -124,9 +136,9 @@ class Monitor:
             try:
                 parsed = await self.fetch(sheet)
                 fetched.append((sheet["id"], parsed, time.time()))
-            except Exception:
+            except Exception as exc:
                 failed.append(sheet["title"])
-                log.exception("Failed to refresh sheet %s; preserving cache", sheet["id"])
+                audit("cache_refresh_failed", level=logging.WARNING, sheet_id=sheet["id"], error=exc)
         async with self.lock:
             with self.db.conn:
                 for sheet_id, parsed, timestamp in fetched:
@@ -199,15 +211,19 @@ class Monitor:
                             "link_preview_options": LinkPreviewOptions(is_disabled=True),
                         }
                     await self.bot.send_message(item["user_id"], item["text"], **kwargs)
-                except TelegramForbiddenError:
+                except TelegramForbiddenError as exc:
                     self.db.execute(
                         "UPDATE outbox SET status='blocked' WHERE user_id=? AND status='pending'",
                         (item["user_id"],),
                     )
-                except TelegramBadRequest:
+                    audit(
+                        "notification_blocked", level=logging.WARNING, notification_id=item["id"], error=exc
+                    )
+                except TelegramBadRequest as exc:
                     self.db.execute("UPDATE outbox SET status='failed' WHERE id=?", (item["id"],))
-                    log.exception("Invalid notification %s", item["id"])
+                    audit("notification_invalid", level=logging.ERROR, notification_id=item["id"], error=exc)
                 except TelegramRetryAfter as exc:
+                    audit("delivery_throttled", level=logging.WARNING, retry_after=exc.retry_after)
                     self.delivery_after = time.time() + exc.retry_after
                     self.db.execute(
                         "INSERT INTO settings VALUES('delivery_after',?) ON CONFLICT(key) "
@@ -218,23 +234,30 @@ class Monitor:
                         "UPDATE outbox SET next_attempt=? WHERE status='pending'", (self.delivery_after,)
                     )
                     break
-                except Exception:
+                except Exception as exc:
                     attempts = item["attempts"] + 1
                     self.db.execute(
                         "UPDATE outbox SET attempts=?,next_attempt=? WHERE id=?",
                         (attempts, time.time() + min(3600, 2 ** min(attempts, 12)), item["id"]),
                     )
-                    log.exception("Notification %s will be retried", item["id"])
+                    audit(
+                        "notification_retry",
+                        level=logging.WARNING,
+                        notification_id=item["id"],
+                        attempt=attempts,
+                        error=exc,
+                    )
                 else:
                     self.db.execute("UPDATE outbox SET status='sent' WHERE id=?", (item["id"],))
+                    audit("notification_sent", level=logging.DEBUG, notification_id=item["id"])
 
     async def run_delivery(self):
         while True:
             try:
                 await self.deliver()
                 self.db.cleanup()
-            except Exception:
-                log.exception("Delivery iteration failed")
+            except Exception as exc:
+                audit("delivery_failed", level=logging.ERROR, error=exc)
             await asyncio.sleep(2)
 
     async def run(self, interval):
@@ -251,5 +274,5 @@ class Monitor:
                     continue
             try:
                 await self.scan(scheduled=True)
-            except Exception:
-                log.exception("Monitor iteration failed")
+            except Exception as exc:
+                audit("monitor_failed", level=logging.ERROR, error=exc)

@@ -4,6 +4,7 @@ import sqlite3
 import time
 from pathlib import Path
 
+from .logging_setup import audit
 from .presentation import bold, create_view, table_link
 from .sheets import sheet_url
 
@@ -96,8 +97,10 @@ class Database:
         return user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
 
     def grant_members(self, entries):
+        count = 0
         with self.conn:
             for user_id, username, name in entries:
+                count += 1
                 self.conn.execute(
                     "INSERT INTO members VALUES(?,?,?) ON CONFLICT(id) "
                     "DO UPDATE SET name=excluded.name,username=excluded.username",
@@ -105,6 +108,8 @@ class Database:
                 )
                 if self.all("SELECT id FROM users WHERE id=?", (user_id,)):
                     self._save_name(user_id, name)
+        if count:
+            audit("members_granted", count=count)
 
     def activate(self, user_id):
         member = self.all("SELECT name FROM members WHERE id=?", (user_id,))
@@ -138,6 +143,7 @@ class Database:
             self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
             self.conn.execute("DELETE FROM views WHERE owner=?", (user_id,))
             self.conn.execute("DELETE FROM outbox WHERE user_id=?", (user_id,))
+        audit("member_revoked", count=int(bool(result.rowcount)))
         return bool(result.rowcount)
 
     def toggle_notifications(self, user_id):
@@ -191,7 +197,8 @@ class Database:
                     admin=True,
                     actions=[[("Принять", f"approve:{sheet_id}"), ("Отклонить", f"reject:{sheet_id}")]],
                 )
-            return sheet_id
+        audit("sheet_added", sheet_id=sheet_id)
+        return sheet_id
 
     def snapshot(self, user_id, sheet_id, grades, notifications):
         with self.conn:
