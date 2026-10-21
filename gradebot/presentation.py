@@ -28,20 +28,26 @@ def safe_lines(value):
 
 def paginate(lines, limit=3500):
     pages, current = [], []
+    in_pre = False
     for line in lines:
-        if len(line) > limit:
+        next_in_pre = False if line.endswith("</pre>") else True if line.startswith("<pre>") else in_pre
+        suffix = "\n</pre>" if next_in_pre else ""
+        if len(line) + len(suffix) > limit:
             raise ValueError("Message line exceeds page size")
-        if current and len("\n".join([*current, line])) > limit:
-            pages.append("\n".join(current))
-            current = []
+        if current and len("\n".join([*current, line])) + len(suffix) > limit:
+            if in_pre:
+                current.append("</pre>")
+            pages.append("\n".join(current).replace("<pre>\n", "<pre>").replace("\n</pre>", "</pre>"))
+            current = ["<pre>"] if in_pre else []
         current.append(line)
+        in_pre = next_in_pre
     if current:
-        pages.append("\n".join(current))
+        pages.append("\n".join(current).replace("<pre>\n", "<pre>").replace("\n</pre>", "</pre>"))
     return pages or ["Нет данных"]
 
 
-def create_view(db, owner, lines, *, admin=False, actions=None):
-    pages = paginate(lines)
+def create_view(db, owner, lines, *, admin=False, actions=None, pages=None):
+    pages = pages if pages is not None else paginate(lines)
     view_id = secrets.token_hex(8)
     if isinstance(actions, dict):
         actions = {
@@ -84,7 +90,7 @@ def view_markup(db, view_id, page=0):
         [
             (label, data)
             for label, data in buttons
-            if not data.startswith(("approve:", "reject:")) or int(data.split(":")[1]) in pending
+            if not data.startswith(("approve:", "reject:", "configure:")) or int(data.split(":")[1]) in pending
         ]
         for buttons in actions
     ]

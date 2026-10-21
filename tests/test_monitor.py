@@ -180,7 +180,7 @@ async def test_manual_scan_refreshes_cache_and_notifies_without_duplicates(db):
     await monitor.check_user(123)
     monitor.fetch = AsyncMock(return_value=parsed("4"))
     result = await monitor.scan()
-    assert result == {"updated": 1, "failed": [], "notifications": 1}
+    assert result == {"updated": 1, "failed": [], "notifications": 1, "structure_notifications": 0}
     assert (await monitor.inspect_user(123))[0]["grades"] == {"С1": "4"}
     assert monitor.bot.send_message.await_count == 1
     result = await monitor.scan()
@@ -276,3 +276,42 @@ async def test_legacy_unauthorized_queue_is_not_delivered(db):
     await Monitor(db, None, bot).deliver()
     bot.send_message.assert_not_called()
     assert not db.all("SELECT * FROM outbox")
+
+
+async def test_admin_without_member_entry_receives_grade_changes(db):
+    db.execute("INSERT INTO settings VALUES('admin','123')")
+    db.execute("DELETE FROM members WHERE id=123")
+    assert db.authorized(123)
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+    first = await monitor.scan()
+    assert first["notifications"] == 1
+    assert json.loads(db.all("SELECT grades FROM snapshots WHERE user_id=123")[0]["grades"]) == {"С1": "4"}
+    monitor.bot.send_message.reset_mock()
+    unchanged = await monitor.scan()
+    assert unchanged["notifications"] == 0
+    monitor.bot.send_message.assert_not_called()
+    monitor.fetch.return_value = parsed("5")
+    changed = await monitor.scan()
+    assert changed["notifications"] == 1
+    assert monitor.bot.send_message.await_args.args[0] == 123
+    assert "С1: 5" in monitor.bot.send_message.await_args.args[1]
+
+
+async def test_legacy_user_without_access_is_still_excluded(db):
+    db.execute("DELETE FROM members WHERE id=123")
+    db.execute("INSERT INTO settings VALUES('admin','999')")
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+    result = await monitor.scan()
+    assert result["notifications"] == 0
+    assert not db.all("SELECT * FROM snapshots WHERE user_id=123")
+    monitor.bot.send_message.assert_not_called()
+
+
+def test_new_table_announcement_includes_admin_without_member_entry(db):
+    db.execute("INSERT INTO settings VALUES('admin','123')")
+    db.execute("DELETE FROM members WHERE id=123")
+    with db.conn:
+        db.broadcast_table("Алгебра", "https://docs.google.com/spreadsheets/d/algebra/edit#gid=0")
+    assert [r["user_id"] for r in db.all("SELECT user_id FROM outbox WHERE kind='table'")] == [123]

@@ -11,8 +11,9 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import LinkPreviewOptions
 
 from .logging_setup import audit
-from .presentation import bold, safe_lines, table_link, view_markup
-from .sheets import Sheet, fetch_sheet
+from .presentation import bold, paginate, safe_lines, table_link, view_markup
+from .sheets import Sheet, discover_sheets, fetch_sheet
+from .structure import header_signature, structure_message, workbook_changes, workbook_url
 
 
 def cache_caption(report, label="Последнее обновление"):
@@ -24,12 +25,17 @@ def cache_caption(report, label="Последнее обновление"):
     return f"<i>{prefix}{label}: {date}</i>"
 
 
-def format_grades(report):
-    lines = [f"<b>{table_link(report['title'], report['url'])}</b>", cache_caption(report)]
+def format_grades(report, *, limit=3, include_caption=True):
+    lines = [f"<b>{table_link(report['title'], report['url'])}</b>"]
     if report["status"] == "found":
         filled = [(label, value) for label, value in report["grades"].items() if value.strip()]
-        for label, value in filled[-5:]:
-            lines.extend(safe_lines(f"- {label}: {value}"))
+        recent = list(reversed(filled))
+        visible = recent if limit is None else recent[:limit]
+        if visible:
+            lines.append("<pre>")
+            for label, value in visible:
+                lines.extend(safe_lines(f"- {label}: {value}"))
+            lines.append("</pre>")
         if not filled:
             lines.append("Оценок пока нет")
         numbers = [
@@ -41,7 +47,7 @@ def format_grades(report):
             f"{sum(numbers) / len(numbers):.2f}".rstrip("0").rstrip(".").replace(".", ",") if numbers else "—"
         )
         lines.extend(safe_lines(f"Среднее: {average}"))
-        lines.append(f"Количество оценок: {len(filled)}")
+        lines.append(f"Количество: {len(filled)}")
     else:
         lines.append(
             {
@@ -50,7 +56,23 @@ def format_grades(report):
                 "unavailable": "Таблица ещё не загружена",
             }[report["status"]]
         )
-    return "\n".join(lines)
+    if include_caption:
+        lines.extend(["", cache_caption(report)])
+    return "\n".join(lines).replace("<pre>\n", "<pre>").replace("\n</pre>", "</pre>")
+
+
+def subject_pages(report):
+    if report["status"] != "found":
+        return [format_grades(report)]
+    grades = list(reversed([(k, v) for k, v in report["grades"].items() if v.strip()]))
+    pages = []
+    summary = format_grades(report, limit=0, include_caption=False).splitlines()[-2:]
+    for offset in range(0, max(1, len(grades)), 10):
+        part = {**report, "grades": dict(reversed(grades[offset:offset + 10]))}
+        lines = format_grades(part, limit=None, include_caption=False).splitlines()
+        lines[-2:] = summary
+        pages.extend(paginate([*lines, "", cache_caption(report)]))
+    return pages
 
 
 class Monitor:
@@ -78,12 +100,14 @@ class Monitor:
                     json.loads(cache[0]["rows"]),
                     sheet["header_row"],
                     tuple(json.loads(sheet["name_columns"])),
+                    **json.loads(sheet["parser_options"]),
                 )
                 status, grades = parsed.lookup(user["name"])
                 if baseline and status == "found":
                     self.db.snapshot(user_id, sheet["id"], grades, [])
             reports.append(
                 {
+                    "sheet_id": sheet["id"],
                     "title": sheet["title"],
                     "url": sheet["url"],
                     "status": status,
@@ -101,8 +125,36 @@ class Monitor:
 
     async def fetch(self, sheet):
         return await fetch_sheet(
-            self.session, sheet["url"], sheet["header_row"], json.loads(sheet["name_columns"])
+            self.session, sheet["url"], sheet["header_row"], json.loads(sheet["name_columns"]),
+            **json.loads(sheet["parser_options"])
         )
+
+    async def discover(self, url):
+        if self.session is None:
+            return None
+        return await discover_sheets(self.session, url)
+
+    def record_structure(self, sheet, rows, invalid=False):
+        options = json.loads(sheet["parser_options"])
+        signature = header_signature(rows, sheet["header_row"], options.get("header_start"))
+        previous = self.db.all("SELECT * FROM sheet_structure WHERE sheet_id=?", (sheet["id"],))
+        old = json.loads(previous[0]["signature"]) if previous else None
+        was_invalid = bool(previous[0]["invalid"]) if previous else False
+        if old is None:
+            cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
+            if cache:
+                old = header_signature(json.loads(cache[0]["rows"]), sheet["header_row"],
+                                       options.get("header_start"))
+        changed = (old is not None and old != signature) or invalid != was_invalid
+        admin = self.db.admin_id()
+        if changed and admin is not None:
+            self.db.queue(admin, structure_message(sheet, old, signature, invalid), kind="structure", admin=True)
+        self.db.conn.execute(
+            "INSERT INTO sheet_structure VALUES(?,?,?) ON CONFLICT(sheet_id) "
+            "DO UPDATE SET signature=excluded.signature,invalid=excluded.invalid",
+            (sheet["id"], json.dumps(signature), int(invalid)),
+        )
+        return int(changed and admin is not None)
 
     async def scan(self, *, scheduled=False):
         async with self.scan_lock:
@@ -129,22 +181,61 @@ class Monitor:
                 self.schedule_changed.set()
 
     async def _scan(self):
-        fetched, failed = [], []
+        fetched, failed, structures, workbooks = [], [], [], []
         notifications = 0
+        sheets = self.db.all("SELECT * FROM sheets WHERE status='approved'")
+        # Discover each workbook once, even if many of its tabs are saved.
+        for url in dict.fromkeys(workbook_url(sheet["url"]) for sheet in sheets):
+            try:
+                tabs = await self.discover(url + "/edit")
+                if tabs is not None:
+                    workbooks.append((url, tabs))
+            except Exception as exc:
+                # A failed discovery is not evidence that tabs have disappeared.
+                audit("workbook_discovery_failed", level=logging.WARNING, error=exc)
         # Fetch outside the state lock: cached commands remain immediate during network outages.
-        for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
+        for sheet in sheets:
             try:
                 parsed = await self.fetch(sheet)
                 fetched.append((sheet["id"], parsed, time.time()))
+                structures.append((sheet["id"], parsed.rows, False))
             except Exception as exc:
                 failed.append(sheet["title"])
+                if hasattr(exc, "rows"):
+                    structures.append((sheet["id"], exc.rows, True))
                 audit("cache_refresh_failed", level=logging.WARNING, sheet_id=sheet["id"], error=exc)
         async with self.lock:
             with self.db.conn:
+                structure_notifications = 0
+                active = {sheet["id"]: sheet for sheet in self.db.all(
+                    "SELECT * FROM sheets WHERE status='approved'")}
+                bases = {workbook_url(sheet["url"]) for sheet in active.values()}
+                for watch in self.db.all("SELECT url FROM workbook_watch"):
+                    if watch["url"] not in bases:
+                        self.db.conn.execute("DELETE FROM workbook_watch WHERE url=?", (watch["url"],))
+                for url, tabs in workbooks:
+                    if url not in bases:
+                        continue
+                    previous = self.db.all("SELECT tabs FROM workbook_watch WHERE url=?", (url,))
+                    if previous:
+                        changes = workbook_changes(json.loads(previous[0]["tabs"]), tabs)
+                        if changes and self.db.admin_id() is not None:
+                            self.db.queue(self.db.admin_id(), [bold("Изменились листы Google-таблицы"),
+                                          table_link("Открыть таблицу", url + "/edit"), *changes,
+                                          "Нужные новые листы можно добавить через /add"],
+                                          kind="structure", admin=True)
+                            structure_notifications += 1
+                    self.db.conn.execute(
+                        "INSERT INTO workbook_watch VALUES(?,?) ON CONFLICT(url) DO UPDATE SET tabs=excluded.tabs",
+                        (url, json.dumps(tabs)),
+                    )
+                for sheet_id, rows, invalid in structures:
+                    if sheet_id in active:
+                        structure_notifications += self.record_structure(active[sheet_id], rows, invalid)
                 for sheet_id, parsed, timestamp in fetched:
                     if self.db.all("SELECT id FROM sheets WHERE id=? AND status='approved'", (sheet_id,)):
                         self.db.cache(sheet_id, parsed, timestamp)
-                for user in self.db.all("SELECT u.* FROM users u JOIN members m ON m.id=u.id"):
+                for user in self.db.notification_users():
                     lines = [bold("Найдены новые оценки:"), ""]
                     for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
                         cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
@@ -154,6 +245,7 @@ class Monitor:
                             json.loads(cache[0]["rows"]),
                             sheet["header_row"],
                             tuple(json.loads(sheet["name_columns"])),
+                            **json.loads(sheet["parser_options"]),
                         )
                         status, grades = parsed.lookup(user["name"])
                         if status != "found":
@@ -182,7 +274,8 @@ class Monitor:
                         self.db.queue(user["id"], lines)
                         notifications += 1
         await self.deliver()
-        return {"updated": len(fetched), "failed": failed, "notifications": notifications}
+        return {"updated": len(fetched), "failed": failed, "notifications": notifications,
+                "structure_notifications": structure_notifications}
 
     async def deliver(self):
         async with self.delivery_lock:
@@ -199,7 +292,7 @@ class Monitor:
                 if not self.db.authorized(item["user_id"]):
                     self.db.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
                     continue
-                if item["kind"] == "proposal" and item["user_id"] != self.db.admin_id():
+                if item["kind"] in {"proposal", "structure"} and item["user_id"] != self.db.admin_id():
                     self.db.execute("UPDATE outbox SET status='cancelled' WHERE id=?", (item["id"],))
                     continue
                 try:

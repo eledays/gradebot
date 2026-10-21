@@ -23,6 +23,7 @@ EVENTS = frozenset(
         "refresh_finished",
         "refresh_failed",
         "cache_refresh_failed",
+        "workbook_discovery_failed",
         "notification_sent",
         "notification_blocked",
         "notification_invalid",

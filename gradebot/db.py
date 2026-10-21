@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from .logging_setup import audit
@@ -33,6 +34,11 @@ class Database:
           id INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
           header_row INTEGER NOT NULL, name_columns TEXT NOT NULL,
           proposer INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS workbook_watch(
+          url TEXT PRIMARY KEY, tabs TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS sheet_structure(
+          sheet_id INTEGER PRIMARY KEY REFERENCES sheets(id) ON DELETE CASCADE,
+          signature TEXT NOT NULL, invalid INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS snapshots(
           user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
           sheet_id INTEGER REFERENCES sheets(id) ON DELETE CASCADE,
@@ -62,12 +68,14 @@ class Database:
             self.conn.execute("ALTER TABLE users ADD COLUMN notifications INTEGER NOT NULL DEFAULT 1")
         if "created_at" not in {row["name"] for row in self.all("PRAGMA table_info(views)")}:
             self.conn.execute("ALTER TABLE views ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+        if "parser_options" not in {row["name"] for row in self.all("PRAGMA table_info(sheets)")}:
+            self.conn.execute("ALTER TABLE sheets ADD COLUMN parser_options TEXT NOT NULL DEFAULT '{}'")
         # Migrate CSV URLs without producing duplicate logical sheets.
         with self.conn:
             # Never reuse IDs referenced by old Telegram moderation buttons.
             maximum = self.all("SELECT COALESCE(MAX(id),0) AS n FROM sheets")[0]["n"]
             for view in self.all("SELECT actions FROM views"):
-                for match in re.finditer(r"(?:approve|reject):(\d+)", view["actions"]):
+                for match in re.finditer(r"(?:approve|reject|configure):(\d+)", view["actions"]):
                     maximum = max(maximum, int(match[1]))
             self.conn.execute(
                 "INSERT INTO settings VALUES('sheet_sequence',?) ON CONFLICT(key) "
@@ -172,7 +180,7 @@ class Database:
 
     def add_sheet(self, title, url, header_row, columns, proposer, status, *, parsed=None, notify=False):
         url = sheet_url(url)
-        with self.conn:
+        with nullcontext() if self.conn.in_transaction else self.conn:
             if self.title_exists(title):
                 raise DuplicateTitleError(title)
             sheet_id = int(self.all("SELECT value FROM settings WHERE key='sheet_sequence'")[0][0]) + 1
@@ -182,6 +190,10 @@ class Database:
                 (sheet_id, title, url, header_row, json.dumps(columns), proposer, status),
             )
             if parsed is not None:
+                self.conn.execute("UPDATE sheets SET parser_options=? WHERE id=?", (
+                    json.dumps({"header_start": parsed.header_start, "grade_columns": parsed.grade_columns}),
+                    sheet_id,
+                ))
                 self.cache(sheet_id, parsed)
             if status == "approved" and notify:
                 self.broadcast_table(title, url)
@@ -195,7 +207,7 @@ class Database:
                     ],
                     kind="proposal",
                     admin=True,
-                    actions=[[("Принять", f"approve:{sheet_id}"), ("Отклонить", f"reject:{sheet_id}")]],
+                    actions=[[("Настроить", f"configure:{sheet_id}"), ("Отклонить", f"reject:{sheet_id}")]],
                 )
         audit("sheet_added", sheet_id=sheet_id)
         return sheet_id
@@ -224,8 +236,22 @@ class Database:
             (user_id, pages[0], view_id, kind, time.time()),
         )
 
+    def remember_workbook(self, url, tabs):
+        from .structure import workbook_url
+
+        self.conn.execute("INSERT OR IGNORE INTO workbook_watch(url,tabs) VALUES(?,?)",
+                          (workbook_url(url), json.dumps(tabs)))
+
+    def notification_users(self):
+        """Activated users with access, including an administrator outside the member list."""
+        return self.all(
+            "SELECT u.* FROM users u WHERE u.id=? "
+            "OR EXISTS (SELECT 1 FROM members m WHERE m.id=u.id)",
+            (self.admin_id(),),
+        )
+
     def broadcast_table(self, title, url):
-        for user in self.all("SELECT u.id FROM users u JOIN members m ON m.id=u.id"):
+        for user in self.notification_users():
             self.queue(
                 user["id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
             )

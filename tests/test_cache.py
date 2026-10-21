@@ -163,7 +163,7 @@ def test_new_table_broadcast_is_persistent_and_uses_web_link(db):
     assert all(view_markup(db, row["view_id"]) is None for row in rows)
 
 
-def test_grade_summary_shows_last_five_but_statistics_use_every_column():
+def test_grade_summary_shows_last_three_but_statistics_use_every_column():
     report = {
         "title": "ОРГ",
         "url": "https://docs.google.com/spreadsheets/d/id/edit",
@@ -176,8 +176,11 @@ def test_grade_summary_shows_last_five_but_statistics_use_every_column():
     }
     text = format_grades(report)
     assert "С1: 10" not in text and "С2: 10" not in text
-    assert all(f"- С{i}:" in text for i in range(3, 8))
-    assert "Среднее: 5,71" in text and "Количество оценок: 7" in text
+    assert all(f"- С{i}:" in text for i in range(5, 8))
+    assert "- С4:" not in text
+    assert text.index("- С7:") < text.index("- С6:") < text.index("- С5:")
+    assert text.endswith("</i>")
+    assert "Среднее: 5,71" in text and "Количество: 7" in text
 
 
 def test_grade_summary_handles_empty_text_zero_and_decimal_grades():
@@ -190,10 +193,10 @@ def test_grade_summary_handles_empty_text_zero_and_decimal_grades():
         "grades": {"С1": "0", "С2": "", "С3": "н", "С4": "4,5", "С5": "3.0", "С6": " "},
     }
     text = format_grades(report)
-    assert "Среднее: 2,5" in text and "Количество оценок: 4" in text
+    assert "Среднее: 2,5" in text and "Количество: 4" in text
     report["grades"] = {"С1": "", "С2": " "}
     text = format_grades(report)
-    assert "Оценок пока нет" in text and "Среднее: —" in text and "Количество оценок: 0" in text
+    assert "Оценок пока нет" in text and "Среднее: —" in text and "Количество: 0" in text
 
 
 def test_duplicate_title_is_rejected_at_database_boundary(db):
