@@ -26,6 +26,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+from .columns import PAGE_SIZE, column_picker
 from .db import DuplicateTitleError
 from .logging_setup import audit
 from .monitor import Monitor, cache_caption, format_grades, subject_pages
@@ -43,6 +44,7 @@ from .sheets import (
     sheet_url,
     valid_name,
 )
+from .structure import header_signature, workbook_url
 
 
 def help_message(interval, contact_username, *, admin=False, name=None, fetched_at=None):
@@ -73,6 +75,7 @@ def help_message(interval, contact_username, *, admin=False, name=None, fetched_
             "/add — добавить таблицу\n"
             "/pending — предложения на проверку\n"
             "/refresh — обновить кэш и проверить изменения\n"
+            "/columns — исключить или вернуть столбцы\n"
             "/remove — удалить таблицу\n"
             "/members — список пользователей\n"
             "/access — добавить пользователей или исправить ФИО\n"
@@ -101,6 +104,7 @@ class Dialog(StatesGroup):
     sheet_columns = State()
     sheet_retry = State()
     workbook_confirm = State()
+    edit_columns = State()
     remove = State()
 
 
@@ -157,7 +161,7 @@ def menu(admin=False):
                 ["Пользователи", "Добавить пользователей"],
                 ["Добавить таблицу", "Предложения"],
                 ["Обновить", "Удалить таблицу"],
-                ["Закрыть доступ"],
+                ["Столбцы", "Закрыть доступ"],
             ]
         )
     return ReplyKeyboardMarkup(
@@ -315,24 +319,161 @@ def create_router(db, monitor, contact_username=""):
     @router.message(F.text == "Таблицы")
     @router.message(Command("tables"))
     async def tables(message: Message):
-        rows = db.all("SELECT * FROM sheets WHERE status='approved'")
-        lines = [bold("Таблицы группы"), ""]
+        rows = db.all("SELECT s.*,c.fetched_at FROM sheets s LEFT JOIN sheet_cache c ON c.sheet_id=s.id "
+                      "WHERE s.status='approved' ORDER BY s.id")
+        groups = {}
         for row in rows:
-            lines.append(f"#{row['id']}: {table_link(row['title'], row['url'])}")
-            cache = db.all("SELECT fetched_at FROM sheet_cache WHERE sheet_id=?", (row["id"],))
-            timestamp = cache[0]["fetched_at"] if cache else None
-            lines.extend(
-                [
-                    cache_caption(
-                        {
-                            "fetched_at": timestamp,
-                            "stale": timestamp is None or time.time() - timestamp > monitor.interval * 2,
-                        }
-                    ),
-                    "",
-                ]
-            )
-        await send_view(message, db, lines if rows else ["Таблиц пока нет"])
+            groups.setdefault(workbook_url(row["url"]), []).append(row)
+        lines = [bold("Таблицы группы"), ""]
+        now = time.time()
+        for group in groups.values():
+            prefix = ""
+            if len(group) > 1:
+                common = []
+                for parts in zip(*(row["title"].split(" · ")[:-1] for row in group), strict=False):
+                    if len(set(parts)) != 1:
+                        break
+                    common.append(parts[0])
+                title = " · ".join(common)
+                lines.append(bold(title or "Листы одной таблицы"))
+                prefix = title + " · " if title else ""
+            for row in group:
+                title = row["title"].removeprefix(prefix)
+                lines.append(f"#{row['id']}: {table_link(title, row['url'])}")
+            timestamps = [row["fetched_at"] for row in group if row["fetched_at"] is not None]
+            lines.append(cache_caption({
+                "fetched_at": max(timestamps, default=None),
+                "stale": any(row["fetched_at"] is None or now - row["fetched_at"] > monitor.interval * 2
+                             for row in group),
+            }))
+            if timestamps and len(timestamps) != len(group):
+                lines.append("Кэш загружен не для всех листов")
+            lines.append("")
+        actions = {f"#{row['id']}:": [(f"Столбцы #{row['id']}", f"pick_columns:{row['id']}")] for row in rows}
+        await send_view(message, db, lines if rows else ["Таблиц пока нет"],
+                        actions=actions if message.from_user.id == db.admin_id() else None)
+
+    @router.message(F.text == "Столбцы")
+    @router.message(Command("columns"))
+    async def columns_command(message: Message, state: FSMContext):
+        if message.from_user.id != db.admin_id():
+            await message.answer("Команда доступна админу")
+            return
+        await state.clear()
+        rows = db.all("SELECT * FROM sheets WHERE status='approved'")
+        lines, actions = [bold("Выбери таблицу для настройки столбцов"), ""], {}
+        for row in rows:
+            anchor = f"#{row['id']}:"
+            lines.append(f"{anchor} {table_link(row['title'], row['url'])}")
+            actions[anchor] = [(f"Столбцы #{row['id']}", f"pick_columns:{row['id']}")]
+        await send_view(message, db, lines if rows else ["Таблиц пока нет"], admin=True, actions=actions)
+
+    @router.callback_query(F.data.regexp(r"^pick_columns:\d+$"))
+    async def edit_columns(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id != db.admin_id():
+            await callback.answer("Только для админа", show_alert=True)
+            return
+        sheet_id = int(callback.data.split(":")[1])
+        rows = db.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
+        if not rows:
+            await callback.answer("Таблица больше недоступна", show_alert=True)
+            return
+        cache = db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
+        if not cache:
+            await callback.answer("Кэш ещё не загружен. Сначала нажми «Обновить»", show_alert=True)
+            return
+        sheet = rows[0]
+        options = json.loads(sheet["parser_options"])
+        raw_rows = json.loads(cache[0]["rows"])
+        try:
+            parsed = Sheet(raw_rows, sheet["header_row"], tuple(json.loads(sheet["name_columns"])), **options)
+            all_columns = Sheet(raw_rows, sheet["header_row"], parsed.name_columns,
+                                options.get("header_start") or sheet["header_row"])
+        except SheetError as exc:
+            await callback.answer(str(exc)[:180], show_alert=True)
+            return
+        await callback.answer()
+        if not isinstance(callback.message, Message):
+            return
+        await state.clear()
+        await state.set_state(Dialog.edit_columns)
+        await state.update_data(edit_sheet_id=sheet_id, edit_options=sheet["parser_options"],
+                                edit_signature=header_signature(raw_rows, sheet["header_row"],
+                                                                options.get("header_start")))
+        await open_column_picker(callback.message, state, all_columns.labels, parsed.labels, sheet["title"])
+
+    async def open_column_picker(message, state, labels, selected, title):
+        await state.update_data(column_labels=labels, column_selected=list(selected), column_page=0,
+                                column_title=title, column_token=secrets.token_hex(8))
+        text, markup = column_picker(await state.get_data())
+        await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+    @router.callback_query(F.data.regexp(r"^colpick:[a-f0-9]{16}:(\d+|page\d+|all|done|cancel)$"))
+    async def select_column(callback: CallbackQuery, state: FSMContext):
+        if callback.from_user.id != db.admin_id():
+            await callback.answer("Только для админа", show_alert=True)
+            return
+        _, token, action = callback.data.split(":")
+        data = await state.get_data()
+        if (token != data.get("column_token") or await state.get_state() not in {
+            Dialog.sheet_columns.state, Dialog.edit_columns.state,
+        }):
+            await callback.answer("Настройка устарела")
+            return
+        if not isinstance(callback.message, Message):
+            await callback.answer()
+            return
+        selected = set(data["column_selected"])
+        labels = {int(i): label for i, label in data["column_labels"].items()}
+        if action in {"done", "cancel"}:
+            if action == "done":
+                try:
+                    if data.get("edit_sheet_id"):
+                        async with monitor.lock:
+                            db.update_grade_columns(data["edit_sheet_id"], selected,
+                                                    expected_options=data["edit_options"],
+                                                    expected_signature=data["edit_signature"])
+                    else:
+                        await state.update_data(grade_columns=sorted(selected))
+                except SheetError as exc:
+                    await callback.answer(str(exc)[:180], show_alert=True)
+                    return
+            await callback.answer("Сохранено" if action == "done" else "Отменено")
+            await callback.message.edit_reply_markup(reply_markup=None)
+            if data.get("edit_sheet_id"):
+                await state.clear()
+                await callback.message.answer(
+                    f"Столбцы «{data['column_title']}» сохранены. Отслеживается: {len(selected)}"
+                    if action == "done" else "Изменения отменены", reply_markup=menu(True))
+            else:
+                await state.update_data(column_token=None)
+                await show_columns(callback.message, state)
+            return
+        if action == "all":
+            selected = set(labels)
+        elif action.startswith("page"):
+            page = int(action[4:])
+            if page * PAGE_SIZE >= len(labels):
+                await callback.answer("Страница не найдена")
+                return
+            await state.update_data(column_page=page)
+        else:
+            index = int(action)
+            if index not in labels:
+                await callback.answer("Столбец не найден")
+                return
+            selected.symmetric_difference_update({index})
+            if not selected:
+                await callback.answer("Оставь хотя бы один столбец оценок", show_alert=True)
+                return
+        await state.update_data(column_selected=sorted(selected))
+        await callback.answer()
+        text, markup = column_picker(await state.get_data())
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc):
+                raise
 
     @router.message(F.text.in_({"Добавить таблицу", "Предложить таблицу"}))
     @router.message(Command("add", "suggest"))
@@ -987,7 +1128,7 @@ def create_router(db, monitor, contact_username=""):
             [InlineKeyboardButton(text="Далее →", callback_data=prefix + ":next")],
             [InlineKeyboardButton(text="Только итоги", callback_data=prefix + ":totals"),
              InlineKeyboardButton(text="Все оценки", callback_data=prefix + ":all")],
-            [InlineKeyboardButton(text="Список столбцов", callback_data=prefix + ":details"),
+            [InlineKeyboardButton(text="Исключить столбцы", callback_data=prefix + ":details"),
              InlineKeyboardButton(text="Исправить структуру", callback_data=prefix + ":layout")],
             [InlineKeyboardButton(text="Пропустить лист", callback_data=prefix + ":skip")],
         ])
@@ -1060,14 +1201,10 @@ def create_router(db, monitor, contact_username=""):
             return False
         if detailed:
             all_columns = Sheet(data["raw_rows"], data["header"], tuple(data["columns"]), data["header_start"])
-            lines = ["Столбцы оценок (✓ — выбраны):"] + [
-                f"{'✓' if i in parsed.labels else '○'} {column_letter(i)}: {label}"
-                for i, label in all_columns.labels.items()
-                if label.strip().casefold() not in {"№", "номер", "п/п", "№ п/п"}
-            ]
-            await setup_view(message, lines)
-            await message.answer("Выбери текстом: «только C,E», «исключить C:F» или «исключить по названию округление»")
+            await open_column_picker(message, state, all_columns.labels, parsed.labels,
+                                     data["tabs"][data["current_index"]]["name"])
             return True
+        await state.update_data(column_token=None)
         tab = data["tabs"][data["current_index"]]
         headers = str(data["header"]) if data["header_start"] == data["header"] else (
             f"{data['header_start']}–{data['header']}")

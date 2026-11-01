@@ -381,6 +381,88 @@ async def test_grades_and_tables_each_send_one_cached_message(dialog_bot):
     h.monitor.fetch.assert_not_called()
 
 
+async def test_tables_group_workbook_tabs_and_keep_individual_actions(dialog_bot):
+    import json
+
+    from gradebot.presentation import view_markup
+
+    h = dialog_bot
+    titles = ["ОРГ", "Алгебра · Семинары 1 модуль", "Другая таблица", "Алгебра · КР 1"]
+    urls = ["org", "algebra", "other", "algebra"]
+    for index, (title, book) in enumerate(zip(titles, urls, strict=True)):
+        h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
+                       1, (1,), 999, "approved",
+                       parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
+        h.db.execute("UPDATE sheet_cache SET fetched_at=? WHERE sheet_id=?", (1793561701 + index, index + 1))
+    h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
+    await h.send("/tables", 999)
+    text = h.replies()[-1]
+    assert '<b>Алгебра</b>\n#2: <a href=' in text
+    assert ">Семинары 1 модуль</a>" in text and ">КР 1</a>" in text
+    assert "Алгебра ·" not in text
+    assert text.index("#1:") < text.index("#2:") < text.index("#4:") < text.index("#3:")
+    assert text.count("Последнее обновление:") == 3
+    assert "#gid=1" in text and "#gid=3" in text
+    from gradebot.monitor import cache_caption
+    assert cache_caption({"fetched_at": 1793561704, "stale": True}) in text
+    view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
+    markup = view_markup(h.db, view["id"])
+    assert {button.callback_data for row in markup.inline_keyboard for button in row} == {
+        f"pick_columns:{index}" for index in range(1, 5)
+    }
+    assert len(h.db.all("SELECT * FROM sheets")) == 4
+    await h.send("Таблицы", 123)
+    view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
+    assert json.loads(view["actions"]) == []
+    assert "<b>Алгебра</b>" in h.replies()[-1]
+    h.monitor.fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("timestamps,expected", [
+    ([None, None], "Кэш ещё не загружен"),
+    ([None, 1000], "Кэш загружен не для всех листов"),
+    ([1, 1000], "Кэш устарел"),
+    ([995, 1000], "Последнее обновление:"),
+])
+async def test_table_group_cache_status_includes_all_tabs(dialog_bot, monkeypatch, timestamps, expected):
+    h = dialog_bot
+    monkeypatch.setattr("gradebot.bot.time.time", lambda: 1000)
+    for index, timestamp in enumerate(timestamps):
+        sheet_id = h.db.add_sheet(f"Алгебра · Лист {index}",
+                                  f"https://docs.google.com/spreadsheets/d/algebra/edit#gid={index}",
+                                  1, (1,), 999, "approved")
+        if timestamp is not None:
+            with h.db.conn:
+                h.db.cache(sheet_id, Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]), fetched_at=timestamp)
+    await h.send("/tables")
+    text = h.replies()[-1]
+    assert expected in text
+    if timestamps == [995, 1000]:
+        assert "Кэш устарел" not in text
+    if any(timestamp is not None for timestamp in timestamps):
+        assert text.count("Последнее обновление:") == 1
+
+
+async def test_table_groups_use_workbook_identity_and_escape_titles(dialog_bot):
+    h = dialog_bot
+    for index, (book, title) in enumerate([
+        ("first", "Алгебра <1> · Семинар & КР"),
+        ("second", "Алгебра <1> · Экзамен"),
+        ("first", "Алгебра <1> · Итоги · Модуль 1"),
+        ("legacy", "Старое название"),
+        ("legacy", "Отдельное название"),
+    ]):
+        h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
+                       1, (1,), 999, "approved")
+    await h.send("/tables")
+    text = h.replies()[-1]
+    assert text.count("<b>Алгебра &lt;1&gt;</b>") == 1
+    assert ">Семинар &amp; КР</a>" in text and ">Итоги · Модуль 1</a>" in text
+    assert ">Алгебра &lt;1&gt; · Экзамен</a>" in text  # Another file remains a single table.
+    assert "<b>Листы одной таблицы</b>" in text
+    assert ">Старое название</a>" in text and ">Отдельное название</a>" in text
+
+
 async def test_pending_is_one_message_with_moderation_actions(dialog_bot):
     h = dialog_bot
     for index in range(3):
@@ -684,6 +766,87 @@ async def test_subject_grades_pagination_is_owned_and_handles_deleted_sheet(dial
 
 async def setup_data(h):
     return await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data()
+
+
+async def test_saved_columns_buttons_save_cancel_and_reject_stale_callbacks(dialog_bot):
+    import json
+
+    h = dialog_bot
+    h.db.activate(123)
+    h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved",
+                   parsed=Sheet([["ФИО", "Квиз", "Экзамен"], ["Иванов Иван", "4", "5"]]))
+    await h.send("Столбцы", 999)
+    assert "Выбери таблицу" in h.replies()[-1]
+    await h.callback("pick_columns:1")
+    token = (await setup_data(h))["column_token"]
+    await h.callback(f"colpick:{token}:3")
+    assert "○ C: Экзамен" in h.replies()[-1]
+    assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] is None
+    await h.callback(f"colpick:{token}:done")
+    assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] == [2]
+    assert await h.state(999) is None
+    await h.callback(f"colpick:{token}:all")
+    assert h.replies()[-1] == "Настройка устарела"
+    await h.callback("pick_columns:1")
+    token = (await setup_data(h))["column_token"]
+    assert (await setup_data(h))["column_selected"] == [2]
+    await h.callback(f"colpick:{token}:all")
+    await h.callback(f"colpick:{token}:cancel")
+    assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] == [2]
+    await h.send("/grades", 123)
+    assert "Экзамен" not in h.replies()[-1] and "Квиз: 4" in h.replies()[-1]
+
+
+async def test_columns_are_admin_only_and_require_cached_approved_sheet(dialog_bot):
+    h = dialog_bot
+    h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved")
+    await h.send("/columns", 123)
+    assert h.replies()[-1] == "Команда доступна админу"
+    await h.callback("pick_columns:1", 123)
+    assert h.replies()[-1] == "Только для админа"
+    await h.callback("pick_columns:1")
+    assert "Кэш ещё не загружен" in h.replies()[-1]
+    assert not (await setup_data(h)).get("column_token")
+    with h.db.conn:
+        h.db.cache(1, Sheet([["ФИО", "Квиз"], ["Иванов Иван", "5"]]))
+    await h.callback("pick_columns:1")
+    token = (await setup_data(h))["column_token"]
+    await h.callback(f"colpick:{token}:2", 123)
+    assert h.replies()[-1] == "Только для админа"
+    await h.callback(f"colpick:{token}:2")
+    assert "хотя бы один" in h.replies()[-1]
+    assert (await setup_data(h))["column_selected"] == [2]
+    h.db.execute("DELETE FROM sheets WHERE id=1")
+    await h.callback(f"colpick:{token}:done")
+    assert "больше недоступны" in h.replies()[-1]
+    await h.callback("pick_columns:1")
+    assert h.replies()[-1] == "Таблица больше недоступна"
+
+
+async def test_setup_column_picker_paging_and_save(dialog_bot, monkeypatch):
+    import json
+
+    h = dialog_bot
+    rows = [["ФИО", *[f"С{i}" for i in range(1, 13)]], ["Иванов Иван", *["5"] * 12]]
+    monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
+    await h.send("/add", 999)
+    await h.send("Матан", 999)
+    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    setup_token = (await setup_data(h))["setup_token"]
+    await h.callback(f"tabs:{setup_token}:next")
+    await h.callback(f"sheetcfg:{setup_token}:0:details")
+    token = (await setup_data(h))["column_token"]
+    await h.callback(f"colpick:{token}:2")
+    await h.callback(f"colpick:{token}:page1")
+    assert "С9" in h.replies()[-1] and "С1\n" not in h.replies()[-1]
+    await h.callback(f"colpick:{token}:13")
+    await h.callback(f"colpick:{token}:done")
+    assert (await setup_data(h))["grade_columns"] == list(range(3, 13))
+    await h.callback(f"colpick:{token}:all")
+    assert h.replies()[-1] == "Настройка устарела"
+    await h.callback(f"sheetcfg:{setup_token}:0:next")
+    await h.callback(f"worksave:{setup_token}")
+    assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] == list(range(3, 13))
 
 
 async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypatch):

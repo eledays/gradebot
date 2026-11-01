@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .logging_setup import audit
 from .presentation import bold, create_view, table_link
-from .sheets import sheet_url
+from .sheets import Sheet, SheetError, sheet_url
+from .structure import header_signature
 
 
 class DuplicateTitleError(ValueError):
@@ -211,6 +212,40 @@ class Database:
                 )
         audit("sheet_added", sheet_id=sheet_id)
         return sheet_id
+
+    def update_grade_columns(self, sheet_id, columns, *, expected_options, expected_signature):
+        """Save selection and preserve comparisons for columns that remain enabled."""
+        with self.conn:
+            sheets = self.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
+            caches = self.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
+            if not sheets or not caches:
+                raise SheetError("Таблица или её кэш больше недоступны. Открой /columns заново")
+            sheet = sheets[0]
+            options = json.loads(sheet["parser_options"])
+            rows = json.loads(caches[0]["rows"])
+            signature = header_signature(rows, sheet["header_row"], options.get("header_start"))
+            if sheet["parser_options"] != expected_options or signature != expected_signature:
+                raise SheetError("Структура или настройки изменились. Открой /columns заново")
+            old = Sheet(rows, sheet["header_row"], tuple(json.loads(sheet["name_columns"])), **options)
+            options["grade_columns"] = sorted(columns)
+            parsed = Sheet(rows, sheet["header_row"], old.name_columns, **options)
+            for snapshot in self.all(
+                "SELECT s.user_id,s.grades,u.name FROM snapshots s JOIN users u ON u.id=s.user_id "
+                "WHERE s.sheet_id=?", (sheet_id,),
+            ):
+                previous = json.loads(snapshot["grades"])
+                status, current = parsed.lookup(snapshot["name"])
+                grades = {}
+                for index, label in parsed.labels.items():
+                    if index in old.labels:
+                        grades[label] = previous.get(old.labels[index], "")
+                    elif status == "found":
+                        # Re-enabling a column starts from the current cached value.
+                        grades[label] = current[label]
+                self.conn.execute("UPDATE snapshots SET grades=? WHERE user_id=? AND sheet_id=?",
+                                  (json.dumps(grades), snapshot["user_id"], sheet_id))
+            self.conn.execute("UPDATE sheets SET parser_options=? WHERE id=?",
+                              (json.dumps(options), sheet_id))
 
     def snapshot(self, user_id, sheet_id, grades, notifications):
         with self.conn:
