@@ -61,6 +61,59 @@ async def test_failed_refresh_preserves_cache_and_its_timestamp(db):
     assert (await monitor.inspect_user(123))[0]["grades"] == {"С1": "5"}
 
 
+@pytest.mark.parametrize("changed", [{2, 3, 4}, {4}, {3}, set()])
+async def test_notification_groups_changed_tabs_under_subject(db, changed):
+    specifications = [
+        ("Алгебра · Семинары 1 модуль", "algebra", 0),
+        ("Другой предмет · Лист1", "other", 0),
+        ("Алгебра · Итоги I семестр", "algebra", 1),
+        ("Алгебра · Неизменённый лист", "algebra", 2),
+    ]
+    for title, book, gid in specifications:
+        db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={gid}",
+                     1, (1,), 999, "approved", parsed=parsed("5"))
+    monitor = Monitor(db, None, AsyncMock())
+    await monitor.inspect_user(123, baseline=True)
+
+    async def fetch(sheet):
+        return parsed("9,5" if sheet["id"] in changed else "5")
+
+    monitor.fetch = AsyncMock(side_effect=fetch)
+    result = await monitor.scan()
+    if not changed:
+        assert result["notifications"] == 0
+        monitor.bot.send_message.assert_not_called()
+        return
+    lines = ["<b>Найдены новые оценки</b>", ""]
+    if changed & {2, 4}:
+        lines.append("<b>Алгебра</b>")
+        if 2 in changed:
+            lines.extend(["Семинары 1 модуль", "- С1: 9,5", ""])
+        if 4 in changed:
+            lines.extend(["Итоги I семестр", "- С1: 9,5", ""])
+    if 3 in changed:
+        lines.extend(["<b>Другой предмет</b>", "Лист1", "- С1: 9,5", ""])
+    assert result["notifications"] == 1
+    monitor.bot.send_message.assert_awaited_once()
+    assert monitor.bot.send_message.await_args.args[1] == "\n".join(lines)
+    assert monitor.bot.send_message.await_args.kwargs["parse_mode"] == "HTML"
+    assert (await monitor.scan())["notifications"] == 0
+
+
+async def test_notification_subject_groups_are_by_file_and_escape_html(db):
+    monitor = Monitor(db, None, AsyncMock())
+    for gid, leaf in enumerate(["Лист <1>", "Лист &2"]):
+        db.add_sheet(f"Предмет <&> · {leaf}", f"https://docs.google.com/spreadsheets/d/book{gid}/edit",
+                     1, (1,), 999, "approved", parsed=parsed("5"))
+    await monitor.inspect_user(123, baseline=True)
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+    await monitor.scan()
+    text = monitor.bot.send_message.await_args.args[1]
+    assert text.count("<b>Предмет &lt;&amp;&gt;</b>") == 2
+    assert "Лист &lt;1&gt;\n- С1: 4" in text
+    assert "Лист &amp;2\n- С1: 4" in text
+
+
 async def test_one_notification_per_user_across_subjects(db):
     db.add_sheet(
         "История",
@@ -80,7 +133,7 @@ async def test_one_notification_per_user_across_subjects(db):
     await monitor.scan()
     assert monitor.bot.send_message.await_count == 1
     text = monitor.bot.send_message.await_args.args[1]
-    assert text == "<b>Найдены новые оценки:</b>\n\n<b>ОРГ</b>\n- С1: 2\n- С2: 3\n\n<b>История</b>\n- С1: 1\n"
+    assert text == "<b>Найдены новые оценки</b>\n\n<b>ОРГ</b>\n- С1: 2\n- С2: 3\n\n<b>История</b>\n- С1: 1\n"
     assert len(db.all("SELECT * FROM outbox")) == 1
     monitor.fetch.side_effect = [Sheet([["ФИО", "С1", "С2"], ["Иванов Иван", "2", "3"]]), parsed("1")]
     await monitor.scan()

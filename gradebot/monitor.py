@@ -13,7 +13,14 @@ from aiogram.types import LinkPreviewOptions
 from .logging_setup import audit
 from .presentation import bold, paginate, safe_lines, table_link, view_markup
 from .sheets import Sheet, discover_sheets, fetch_sheet
-from .structure import header_signature, structure_message, workbook_changes, workbook_url
+from .structure import (
+    group_sheets,
+    header_signature,
+    sheet_group_title,
+    structure_message,
+    workbook_changes,
+    workbook_url,
+)
 
 
 def cache_caption(report, label="Последнее обновление"):
@@ -236,7 +243,8 @@ class Monitor:
                     if self.db.all("SELECT id FROM sheets WHERE id=? AND status='approved'", (sheet_id,)):
                         self.db.cache(sheet_id, parsed, timestamp)
                 for user in self.db.notification_users():
-                    lines = [bold("Найдены новые оценки:"), ""]
+                    lines = [bold("Найдены новые оценки"), ""]
+                    changes = {}
                     for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
                         cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
                         if not cache:
@@ -261,15 +269,26 @@ class Monitor:
                             if old.get(column, "") != value
                         ]
                         if values:
-                            lines.append(bold(sheet["title"]))
-                            for column, value in values:
-                                lines.extend(safe_lines(f"- {column}: {value}"))
-                            lines.append("")
+                            changes[sheet["id"]] = values
                         self.db.conn.execute(
                             "INSERT INTO snapshots VALUES(?,?,?) "
                             "ON CONFLICT(user_id,sheet_id) DO UPDATE SET grades=excluded.grades",
                             (user["id"], sheet["id"], json.dumps(grades)),
                         )
+                    for group in group_sheets(sorted(active.values(), key=lambda sheet: sheet["id"])):
+                        changed = [sheet for sheet in group if sheet["id"] in changes]
+                        if not changed:
+                            continue
+                        subject = sheet_group_title(group)
+                        prefix = subject + " · " if subject else ""
+                        if subject or len(group) > 1:
+                            lines.append(bold(subject or "Листы одной таблицы"))
+                        for sheet in changed:
+                            title = sheet["title"].removeprefix(prefix)
+                            lines.extend(safe_lines(title) if subject or len(group) > 1 else [bold(title)])
+                            for column, value in changes[sheet["id"]]:
+                                lines.extend(safe_lines(f"- {column}: {value}"))
+                            lines.append("")
                     if len(lines) > 2 and user["notifications"]:
                         self.db.queue(user["id"], lines)
                         notifications += 1

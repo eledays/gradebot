@@ -44,7 +44,7 @@ from .sheets import (
     sheet_url,
     valid_name,
 )
-from .structure import header_signature, workbook_url
+from .structure import group_sheets, header_signature, sheet_group_title
 
 
 def help_message(interval, contact_username, *, admin=False, name=None, fetched_at=None):
@@ -321,20 +321,12 @@ def create_router(db, monitor, contact_username=""):
     async def tables(message: Message):
         rows = db.all("SELECT s.*,c.fetched_at FROM sheets s LEFT JOIN sheet_cache c ON c.sheet_id=s.id "
                       "WHERE s.status='approved' ORDER BY s.id")
-        groups = {}
-        for row in rows:
-            groups.setdefault(workbook_url(row["url"]), []).append(row)
         lines = [bold("Таблицы группы"), ""]
         now = time.time()
-        for group in groups.values():
+        for group in group_sheets(rows):
             prefix = ""
             if len(group) > 1:
-                common = []
-                for parts in zip(*(row["title"].split(" · ")[:-1] for row in group), strict=False):
-                    if len(set(parts)) != 1:
-                        break
-                    common.append(parts[0])
-                title = " · ".join(common)
+                title = sheet_group_title(group)
                 lines.append(bold(title or "Листы одной таблицы"))
                 prefix = title + " · " if title else ""
             for row in group:

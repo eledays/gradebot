@@ -8,6 +8,22 @@ def workbook_url(url):
     return sheet_url(url).split("/edit")[0]
 
 
+def group_sheets(sheets):
+    groups = {}
+    for sheet in sheets:
+        groups.setdefault(workbook_url(sheet["url"]), []).append(sheet)
+    return list(groups.values())
+
+
+def sheet_group_title(sheets):
+    common = []
+    for parts in zip(*(sheet["title"].split(" · ")[:-1] for sheet in sheets), strict=False):
+        if len(set(parts)) != 1:
+            break
+        common.append(parts[0])
+    return " · ".join(common)
+
+
 def header_signature(rows, header_row, header_start=None):
     width = max((len(row) for row in rows), default=0)
     start = header_start or header_row
