@@ -241,9 +241,8 @@ def create_router(db, monitor, contact_username=""):
         reports = await monitor.inspect_user(user_id, baseline=first)
         await message.answer(
             f"Привет, {name}!\n\n"
-            "Я знаю твоё имя, потому что администратор вручную добавил тебя "
-            "и твоё ФИО в список доступа.\n\n"
-            "Здесь можно посмотреть свои оценки и получать уведомления об изменениях.",
+            "Мы знакомы, потому что администратор вручную добавил этот аккаунт в список доступа\n\n"
+            "Здесь можно посмотреть свои оценки и получать уведомления об изменениях",
             reply_markup=menu(user_id == db.admin_id()),
         )
         summary = registration_summary(reports)
