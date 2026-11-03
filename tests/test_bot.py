@@ -381,7 +381,76 @@ async def test_grades_and_tables_each_send_one_cached_message(dialog_bot):
     h.monitor.fetch.assert_not_called()
 
 
-async def test_tables_group_workbook_tabs_and_keep_individual_actions(dialog_bot):
+async def test_grades_group_tabs_with_full_titles_and_no_actions(dialog_bot):
+    import json
+
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    for index, (book, title) in enumerate([
+        ("org", "ОРГ"), ("algebra", "Алгебра · Семинары"),
+        ("other", "Другой предмет"), ("algebra", "Алгебра · КР 1"),
+    ]):
+        h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
+                       1, (1,), 999, "approved",
+                       parsed=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"], ["Петров Петр", "2"]]))
+    h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
+    await h.send("/grades")
+    text = h.replies()[-1]
+    assert text.index(">ОРГ</a>") < text.index(">Алгебра · Семинары</a>")
+    assert text.index(">Алгебра · Семинары</a>") < text.index(">Алгебра · КР 1</a>")
+    assert text.index(">Алгебра · КР 1</a>") < text.index(">Другой предмет</a>")
+    assert "<b>Алгебра</b>" not in text
+    assert text.count("- С1: 5") == 4 and "- С1: 2" not in text
+    view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
+    assert json.loads(view["actions"]) == []
+    h.monitor.fetch.assert_not_called()
+
+
+@pytest.mark.parametrize("command,user_id,state_name", [
+    ("/columns", 999, "columns_id"), ("/subject", 123, "subject_id"),
+])
+async def test_id_selection_allows_reading_tables_retries_and_cancel(dialog_bot, command, user_id, state_name):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved",
+                   parsed=Sheet([["ФИО", "Квиз"], ["Иванов Иван", "5"]]))
+    expected = getattr(Dialog, state_name).state
+    await h.send(command, user_id)
+    assert await h.state(user_id) == expected
+    for invalid in ["не число", "0", "-1", "9" * 30]:
+        await h.send(invalid, user_id)
+        assert "числовой ID" in h.replies()[-1]
+        assert await h.state(user_id) == expected
+    await h.send("Таблицы", user_id)
+    assert "Таблицы группы" in h.replies()[-1]
+    assert await h.state(user_id) == expected
+    await h.send("/tables", user_id)
+    assert "Таблицы группы" in h.replies()[-1]
+    assert await h.state(user_id) == expected
+    await h.send("/cancel", user_id)
+    assert await h.state(user_id) is None
+    await h.send(command, user_id)
+    await h.send("1", user_id)
+    if command == "/columns":
+        assert await h.state(user_id) == Dialog.edit_columns.state
+        assert "Нажми на столбец" in h.replies()[-1]
+    else:
+        assert await h.state(user_id) is None
+        assert "Квиз: 5" in h.replies()[-1]
+
+
+@pytest.mark.parametrize("command,user_id", [("/columns", 999), ("/subject", 123)])
+async def test_id_commands_with_no_sheets_do_not_wait_for_input(dialog_bot, command, user_id):
+    h = dialog_bot
+    h.db.activate(123)
+    await h.send(command, user_id)
+    assert h.replies()[-1] == "Таблиц пока нет"
+    assert await h.state(user_id) is None
+
+
+async def test_tables_group_workbook_tabs_without_action_buttons(dialog_bot):
     import json
 
     from gradebot.presentation import view_markup
@@ -407,9 +476,7 @@ async def test_tables_group_workbook_tabs_and_keep_individual_actions(dialog_bot
     assert cache_caption({"fetched_at": 1793561704, "stale": True}) in text
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
     markup = view_markup(h.db, view["id"])
-    assert {button.callback_data for row in markup.inline_keyboard for button in row} == {
-        f"pick_columns:{index}" for index in range(1, 5)
-    }
+    assert markup is None
     assert len(h.db.all("SELECT * FROM sheets")) == 4
     await h.send("Таблицы", 123)
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
@@ -751,7 +818,13 @@ async def test_subject_grades_pagination_is_owned_and_handles_deleted_sheet(dial
     text = h.replies()[-1]
     assert "- С23: 5" in text and "- С20:" not in text
     assert text.endswith("</i>")
-    await h.callback(f"subject:{sheet_id}", 123)
+    await h.send("/subject", 123)
+    await h.send("не число", 123)
+    assert "числовой ID" in h.replies()[-1]
+    await h.send("9999", 123)
+    assert "Таблица больше недоступна" in h.replies()[-1]
+    await h.send(str(sheet_id), 123)
+    assert await h.state(123) is None
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
     pages = json.loads(view["pages"])
     assert view["owner"] == 123 and len(pages) == 3
@@ -776,8 +849,12 @@ async def test_saved_columns_buttons_save_cancel_and_reject_stale_callbacks(dial
     h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved",
                    parsed=Sheet([["ФИО", "Квиз", "Экзамен"], ["Иванов Иван", "4", "5"]]))
     await h.send("Столбцы", 999)
-    assert "Выбери таблицу" in h.replies()[-1]
-    await h.callback("pick_columns:1")
+    assert "Отправь ID таблицы" in h.replies()[-1]
+    await h.send("не число", 999)
+    assert "числовой ID" in h.replies()[-1]
+    await h.send("9999", 999)
+    assert "Таблица больше недоступна" in h.replies()[-1]
+    await h.send("1", 999)
     token = (await setup_data(h))["column_token"]
     await h.callback(f"colpick:{token}:3")
     assert "○ C: Экзамен" in h.replies()[-1]

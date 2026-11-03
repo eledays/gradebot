@@ -279,14 +279,21 @@ async def test_admin_can_delete_table_by_button_with_confirmation(app):
     assert "не найдена" in app.replies()[-1]
 
 
-async def test_admin_can_revoke_by_button_and_outsider_cannot(app):
+async def test_admin_can_revoke_by_id_and_outsider_cannot(app):
     app.db.register(123, "Иванов Иван")
     await app.send("Пользователи")
     method = app.bot.session.await_args.args[1]
-    assert method.reply_markup.inline_keyboard[0][0].callback_data == "pick_revoke:123"
-    await app.click("pick_revoke:123", 123)
+    assert method.reply_markup is None
+    await app.send("/revoke", 123)
     assert app.db.authorized(123)
-    await app.click("pick_revoke:123")
+    assert app.replies()[-1] == "Команда доступна админу"
+    await app.send("/revoke")
+    assert "Отправь ID пользователя" in app.replies()[-1]
+    await app.send("не число")
+    assert "числовой ID" in app.replies()[-1]
+    await app.send("777")
+    assert "Пользователь не найден" in app.replies()[-1]
+    await app.send("123")
     assert app.db.authorized(123)
     data = await app.context().get_data()
     await app.click(f"revoke:{data['token']}")

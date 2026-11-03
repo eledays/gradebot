@@ -64,6 +64,7 @@ def help_message(interval, contact_username, *, admin=False, name=None, fetched_
         "<b>Управление</b>\n"
         "/notifications — включить или выключить уведомления\n"
         "/grades — посмотреть свои оценки\n"
+        "/subject — все свои оценки по ID таблицы\n"
         "/tables — список таблиц\n"
         "/suggest — предложить таблицу\n\n"
         "/cancel — отменить текущий ввод\n"
@@ -105,6 +106,8 @@ class Dialog(StatesGroup):
     sheet_retry = State()
     workbook_confirm = State()
     edit_columns = State()
+    columns_id = State()
+    subject_id = State()
     remove = State()
 
 
@@ -204,6 +207,7 @@ def create_router(db, monitor, contact_username=""):
     guard = AccessMiddleware(db, contact_username)
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
+    menu_labels = {button.text for row in menu(True).keyboard for button in row}
 
     def help_text(user_id):
         users = db.all("SELECT name FROM users WHERE id=?", (user_id,))
@@ -287,17 +291,57 @@ def create_router(db, monitor, contact_username=""):
             return
         reports = await monitor.inspect_user(message.from_user.id)
         lines = [bold("Текущие оценки"), ""]
-        for report in reports:
-            lines.extend(format_grades(report, include_caption=False).splitlines())
-            lines.append("")
-        actions = [[(f"Все оценки: {r['title']}", f"subject:{r['sheet_id']}")] for r in reports]
+        for group in group_sheets(reports):
+            for report in group:
+                lines.extend(format_grades(report, include_caption=False).splitlines())
+                lines.append("")
         if reports:
             timestamps = [r["fetched_at"] for r in reports if r["fetched_at"] is not None]
             lines.append(cache_caption({
                 "fetched_at": min(timestamps) if len(timestamps) == len(reports) else None,
                 "stale": any(r["stale"] for r in reports),
             }))
-        await send_view(message, db, lines if reports else ["Таблиц пока нет"], actions=actions)
+        await send_view(message, db, lines if reports else ["Таблиц пока нет"])
+
+    @router.message(Command("subject"))
+    async def subject_command(message: Message, state: FSMContext):
+        if not registered(message.from_user.id):
+            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            return
+        await state.clear()
+        if not db.all("SELECT id FROM sheets WHERE status='approved'"):
+            await message.answer("Таблиц пока нет")
+            return
+        await state.set_state(Dialog.subject_id)
+        await message.answer("Отправь ID таблицы из /tables, чтобы посмотреть все свои оценки. /cancel — отменить")
+
+    @router.message(Dialog.subject_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
+    async def subject_id(message: Message, state: FSMContext):
+        if not registered(message.from_user.id):
+            await state.clear()
+            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            return
+        try:
+            sheet_id = int(message.text.strip())
+            if not 0 < sheet_id < 2**63:
+                raise ValueError
+        except ValueError:
+            await message.answer("Нужен числовой ID таблицы из /tables")
+            return
+        if await show_subject(message, message.from_user.id, sheet_id):
+            await state.clear()
+
+    async def show_subject(message, user_id, sheet_id):
+        reports = await monitor.inspect_user(user_id)
+        report = next((r for r in reports if r["sheet_id"] == sheet_id), None)
+        if report is None:
+            await message.answer("Таблица больше недоступна. Отправь ID из /tables")
+            return False
+        with db.conn:
+            view_id, pages = create_view(db, user_id, [], pages=subject_pages(report))
+        await message.answer(pages[0], parse_mode="HTML", reply_markup=view_markup(db, view_id),
+                             link_preview_options=LinkPreviewOptions(is_disabled=True))
+        return True
 
     @router.callback_query(F.data.regexp(r"^subject:\d+$"))
     async def subject(callback: CallbackQuery):
@@ -343,9 +387,7 @@ def create_router(db, monitor, contact_username=""):
             if timestamps and len(timestamps) != len(group):
                 lines.append("Кэш загружен не для всех листов")
             lines.append("")
-        actions = {f"#{row['id']}:": [(f"Столбцы #{row['id']}", f"pick_columns:{row['id']}")] for row in rows}
-        await send_view(message, db, lines if rows else ["Таблиц пока нет"],
-                        actions=actions if message.from_user.id == db.admin_id() else None)
+        await send_view(message, db, lines if rows else ["Таблиц пока нет"])
 
     @router.message(F.text == "Столбцы")
     @router.message(Command("columns"))
@@ -354,27 +396,44 @@ def create_router(db, monitor, contact_username=""):
             await message.answer("Команда доступна админу")
             return
         await state.clear()
-        rows = db.all("SELECT * FROM sheets WHERE status='approved'")
-        lines, actions = [bold("Выбери таблицу для настройки столбцов"), ""], {}
-        for row in rows:
-            anchor = f"#{row['id']}:"
-            lines.append(f"{anchor} {table_link(row['title'], row['url'])}")
-            actions[anchor] = [(f"Столбцы #{row['id']}", f"pick_columns:{row['id']}")]
-        await send_view(message, db, lines if rows else ["Таблиц пока нет"], admin=True, actions=actions)
+        if not db.all("SELECT id FROM sheets WHERE status='approved'"):
+            await message.answer("Таблиц пока нет")
+            return
+        await state.set_state(Dialog.columns_id)
+        await message.answer("Отправь ID таблицы из /tables для настройки столбцов. /cancel — отменить")
+
+    @router.message(Dialog.columns_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
+    async def columns_id(message: Message, state: FSMContext):
+        if message.from_user.id != db.admin_id():
+            await state.clear()
+            await message.answer("Команда доступна админу")
+            return
+        try:
+            sheet_id = int(message.text.strip())
+            if not 0 < sheet_id < 2**63:
+                raise ValueError
+        except ValueError:
+            await message.answer("Нужен числовой ID таблицы из /tables")
+            return
+        await open_saved_columns(message, state, sheet_id)
 
     @router.callback_query(F.data.regexp(r"^pick_columns:\d+$"))
     async def edit_columns(callback: CallbackQuery, state: FSMContext):
         if callback.from_user.id != db.admin_id():
             await callback.answer("Только для админа", show_alert=True)
             return
-        sheet_id = int(callback.data.split(":")[1])
+        await callback.answer()
+        if isinstance(callback.message, Message):
+            await open_saved_columns(callback.message, state, int(callback.data.split(":")[1]))
+
+    async def open_saved_columns(message, state, sheet_id):
         rows = db.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
         if not rows:
-            await callback.answer("Таблица больше недоступна", show_alert=True)
+            await message.answer("Таблица больше недоступна")
             return
         cache = db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
         if not cache:
-            await callback.answer("Кэш ещё не загружен. Сначала нажми «Обновить»", show_alert=True)
+            await message.answer("Кэш ещё не загружен. Сначала нажми «Обновить»")
             return
         sheet = rows[0]
         options = json.loads(sheet["parser_options"])
@@ -384,17 +443,14 @@ def create_router(db, monitor, contact_username=""):
             all_columns = Sheet(raw_rows, sheet["header_row"], parsed.name_columns,
                                 options.get("header_start") or sheet["header_row"])
         except SheetError as exc:
-            await callback.answer(str(exc)[:180], show_alert=True)
-            return
-        await callback.answer()
-        if not isinstance(callback.message, Message):
+            await message.answer(str(exc))
             return
         await state.clear()
         await state.set_state(Dialog.edit_columns)
         await state.update_data(edit_sheet_id=sheet_id, edit_options=sheet["parser_options"],
                                 edit_signature=header_signature(raw_rows, sheet["header_row"],
                                                                 options.get("header_start")))
-        await open_column_picker(callback.message, state, all_columns.labels, parsed.labels, sheet["title"])
+        await open_column_picker(message, state, all_columns.labels, parsed.labels, sheet["title"])
 
     async def open_column_picker(message, state, labels, selected, title):
         await state.update_data(column_labels=labels, column_selected=list(selected), column_page=0,
@@ -685,13 +741,11 @@ def create_router(db, monitor, contact_username=""):
         rows = db.all(
             "SELECT m.*,u.id AS active FROM members m LEFT JOIN users u ON u.id=m.id ORDER BY m.name"
         )
-        lines, actions = [bold("Пользователи группы"), ""], {}
+        lines = [bold("Пользователи группы"), ""]
         for row in rows:
             label = f"@{row['username']}" if row["username"] else "без юзернейма"
             anchor = f"#{row['id']}:"
             lines.extend(safe_lines(f"{anchor} {row['name']} · {label} · ID {row['id']}"))
-            if row["id"] != db.admin_id():
-                actions[anchor] = [(f"Закрыть доступ #{row['id']}", f"pick_revoke:{row['id']}")]
             lines.append("Вход выполнен" if row["active"] else "Ещё не заходил")
             lines.append("")
         await send_view(
@@ -699,7 +753,6 @@ def create_router(db, monitor, contact_username=""):
             db,
             lines if rows else ["Список пуст"],
             admin=True,
-            actions=actions,
         )
 
     def access_keyboard(request_id, count=0):
@@ -873,9 +926,11 @@ def create_router(db, monitor, contact_username=""):
             return
         await state.clear()
         await state.set_state(Dialog.revoke)
-        await members(message)
         if not db.all("SELECT id FROM members WHERE id!=?", (db.admin_id(),)):
             await state.clear()
+            await message.answer("Нет пользователей для закрытия доступа")
+            return
+        await message.answer("Отправь ID пользователя из /members, чтобы закрыть доступ. /cancel — отменить")
 
     @router.message(Dialog.revoke, F.text, ~F.text.startswith("/"))
     async def revoke_id(message: Message, state: FSMContext):
@@ -884,6 +939,8 @@ def create_router(db, monitor, contact_username=""):
             return
         try:
             user_id = int(message.text.strip())
+            if not 0 < user_id < 2**63:
+                raise ValueError
         except ValueError:
             await message.answer("Нужен числовой ID из /members")
             return
@@ -1507,6 +1564,8 @@ def create_router(db, monitor, contact_username=""):
             Dialog.member_name.state: "Отправь ФИО выбранного пользователя",
             Dialog.remove_confirm.state: "Жду подтверждение",
             Dialog.revoke.state: "Отправь ID пользователя из /members",
+            Dialog.columns_id.state: "Отправь ID таблицы из /tables",
+            Dialog.subject_id.state: "Отправь ID таблицы из /tables",
             Dialog.revoke_confirm.state: "Жду подтверждение",
         }
         await message.answer(prompts.get(current, help_text(message.from_user.id)), parse_mode="HTML")
