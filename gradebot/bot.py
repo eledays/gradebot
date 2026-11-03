@@ -44,7 +44,7 @@ from .sheets import (
     sheet_url,
     valid_name,
 )
-from .structure import group_sheets, header_signature, sheet_group_title
+from .structure import group_sheets, header_signature, sheet_group_title, sheet_item_title
 
 
 def help_message(interval, contact_username, *, admin=False, name=None, fetched_at=None):
@@ -292,8 +292,15 @@ def create_router(db, monitor, contact_username=""):
         reports = await monitor.inspect_user(message.from_user.id)
         lines = [bold("Текущие оценки"), ""]
         for group in group_sheets(reports):
+            subject = sheet_group_title(group)
+            if subject:
+                lines.append(bold(subject))
             for report in group:
-                lines.extend(format_grades(report, include_caption=False).splitlines())
+                display = {**report, "title": sheet_item_title(report)} if subject else report
+                block = format_grades(display, include_caption=False).splitlines()
+                if subject:
+                    block[0] = "↳ " + block[0]
+                lines.extend(block)
                 lines.append("")
         if reports:
             timestamps = [r["fetched_at"] for r in reports if r["fetched_at"] is not None]
@@ -370,14 +377,13 @@ def create_router(db, monitor, contact_username=""):
         lines = [bold("Таблицы группы"), ""]
         now = time.time()
         for group in group_sheets(rows):
-            prefix = ""
-            if len(group) > 1:
-                title = sheet_group_title(group)
-                lines.append(bold(title or "Листы одной таблицы"))
-                prefix = title + " · " if title else ""
+            subject = sheet_group_title(group)
+            if subject:
+                lines.append(bold(subject))
             for row in group:
-                title = row["title"].removeprefix(prefix)
-                lines.append(f"#{row['id']}: {table_link(title, row['url'])}")
+                title = sheet_item_title(row) if subject else row["title"]
+                marker = "↳ " if subject else ""
+                lines.append(f"{marker}#{row['id']}: {table_link(title, row['url'])}")
             timestamps = [row["fetched_at"] for row in group if row["fetched_at"] is not None]
             lines.append(cache_caption({
                 "fetched_at": max(timestamps, default=None),

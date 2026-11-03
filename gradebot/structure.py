@@ -11,17 +11,22 @@ def workbook_url(url):
 def group_sheets(sheets):
     groups = {}
     for sheet in sheets:
-        groups.setdefault(workbook_url(sheet["url"]), []).append(sheet)
+        subject = sheet["title"].partition(" · ")[0]
+        key = " ".join(subject.casefold().replace("ё", "е").split())
+        groups.setdefault(key, []).append(sheet)
     return list(groups.values())
 
 
 def sheet_group_title(sheets):
-    common = []
-    for parts in zip(*(sheet["title"].split(" · ")[:-1] for sheet in sheets), strict=False):
-        if len(set(parts)) != 1:
-            break
-        common.append(parts[0])
-    return " · ".join(common)
+    if not sheets:
+        return ""
+    subject, separator, _ = sheets[0]["title"].partition(" · ")
+    return subject if separator or len(sheets) > 1 else ""
+
+
+def sheet_item_title(sheet):
+    subject, _, leaf = sheet["title"].partition(" · ")
+    return leaf or subject
 
 
 def header_signature(rows, header_row, header_start=None):

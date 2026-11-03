@@ -100,7 +100,7 @@ async def test_notification_groups_changed_tabs_under_subject(db, changed):
     assert (await monitor.scan())["notifications"] == 0
 
 
-async def test_notification_subject_groups_are_by_file_and_escape_html(db):
+async def test_notification_subject_groups_combine_files_and_escape_html(db):
     monitor = Monitor(db, None, AsyncMock())
     for gid, leaf in enumerate(["Лист <1>", "Лист &2"]):
         db.add_sheet(f"Предмет <&> · {leaf}", f"https://docs.google.com/spreadsheets/d/book{gid}/edit",
@@ -109,7 +109,7 @@ async def test_notification_subject_groups_are_by_file_and_escape_html(db):
     monitor.fetch = AsyncMock(return_value=parsed("4"))
     await monitor.scan()
     text = monitor.bot.send_message.await_args.args[1]
-    assert text.count("<b>Предмет &lt;&amp;&gt;</b>") == 2
+    assert text.count("<b>Предмет &lt;&amp;&gt;</b>") == 1
     assert "Лист &lt;1&gt;\n- С1: 4" in text
     assert "Лист &amp;2\n- С1: 4" in text
 

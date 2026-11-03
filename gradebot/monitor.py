@@ -17,6 +17,7 @@ from .structure import (
     group_sheets,
     header_signature,
     sheet_group_title,
+    sheet_item_title,
     structure_message,
     workbook_changes,
     workbook_url,
@@ -280,12 +281,11 @@ class Monitor:
                         if not changed:
                             continue
                         subject = sheet_group_title(group)
-                        prefix = subject + " · " if subject else ""
-                        if subject or len(group) > 1:
-                            lines.append(bold(subject or "Листы одной таблицы"))
+                        if subject:
+                            lines.append(bold(subject))
                         for sheet in changed:
-                            title = sheet["title"].removeprefix(prefix)
-                            lines.extend(safe_lines(title) if subject or len(group) > 1 else [bold(title)])
+                            title = sheet_item_title(sheet) if subject else sheet["title"]
+                            lines.extend(safe_lines(title) if subject else [bold(title)])
                             for column, value in changes[sheet["id"]]:
                                 lines.extend(safe_lines(f"- {column}: {value}"))
                             lines.append("")
