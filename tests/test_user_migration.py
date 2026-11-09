@@ -55,7 +55,12 @@ def test_cli_user_removal_requires_confirmation_and_cleans_references(
         db.execute("INSERT INTO name_requests VALUES(123,'Another Name',0)")
         db.execute("INSERT INTO registration_drafts VALUES(123,'token')")
         db.execute("INSERT INTO views(id,owner,pages) VALUES('view',123,'[]')")
+        db.execute("INSERT INTO views(id,owner,pages,admin) "
+                   "VALUES('members',999,'[\"#123: Example User · ID 123\"]',1)")
+        db.execute("INSERT INTO views(id,owner,pages,admin) VALUES('proposal',999,'[]',1)")
         db.execute("INSERT INTO outbox(user_id,text) VALUES(123,'queued')")
+        db.execute("INSERT INTO outbox(user_id,text,view_id,kind) "
+                   "VALUES(999,'<i>От пользователя 123</i>','proposal','proposal')")
         db.execute("INSERT INTO sheets(title,url,header_row,name_columns,proposer) "
                    "VALUES('Test','https://docs.google.com/spreadsheets/d/test/edit',1,'[0]',123)")
         db.snapshot(123, 1, {"A": "5"}, [])
@@ -82,6 +87,8 @@ def test_cli_user_removal_requires_confirmation_and_cleans_references(
             assert not db.all(f"SELECT * FROM {table}")
         assert db.all("SELECT proposer FROM sheets")[0][0] == 0
         assert db.blocked(123) == (mode == "block")
+        db.register(456, "New User")
+        assert db.all("SELECT id FROM users WHERE telegram_id=456")[0][0] > local_id
     finally:
         db.close()
     assert "Cancelled" in capsys.readouterr().out
