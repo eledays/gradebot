@@ -30,7 +30,7 @@ from aiogram.types import (
 from .columns import PAGE_SIZE, ColumnPickerData, column_picker
 from .db import Database, DuplicateTitleError, WorkbookDraft
 from .logging_setup import audit
-from .messages import messages
+from .messages import TrustedHtml, messages
 from .monitor import GradeReport, Monitor, cache_caption, format_grades, subject_pages
 from .network import network_sessions
 from .presentation import bold, create_view, safe_lines, send_view, table_link, view_markup
@@ -154,7 +154,8 @@ def menu(admin: bool = False) -> ReplyKeyboardMarkup:
         rows.extend(
             [
                 ["Пользователи", "Создать ссылку"],
-                ["Добавить таблицу", "Предложения"],
+                ["Добавить таблицу", "Добавить лист"],
+                ["Предложения"],
                 ["Обновить", "Удалить таблицу"],
                 ["Столбцы", "Заблокировать"],
             ]
@@ -243,9 +244,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         if not db.authorized(user_id):
             token = (message.text or "").partition(" ")[2].strip()
+            contact = contact_username.strip().lstrip("@")
+            suffix = f" @{contact}" if contact else ""
+            if not token:
+                await message.answer(messages.render("access.invitation_required", contact=suffix))
+                return
             if not db.invitation_valid(token):
-                contact = contact_username.strip().lstrip("@")
-                suffix = f" @{contact}" if contact else ""
                 await message.answer(messages.render("access.expired", contact=suffix))
                 return
             db.begin_join(user_id, token)
@@ -336,9 +340,19 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         db.request_name(message.from_user.id, name)
         await state.clear()
         await message.answer(messages.render("replies.requested_name_1"))
+        user_id = message.from_user.id
+        profile = TrustedHtml(f'<a href="tg://user?id={user_id}">Открыть профиль</a>')
         await message.bot.send_message(
             db.admin_id(),
-            f"Пользователь {message.from_user.id} просит сменить ФИО на {name}",
+            messages.render(
+                "replies.name_request_admin",
+                old_name=db.member_name(user_id) or "не указано",
+                new_name=name,
+                telegram_id=user_id,
+                username=f"@{message.from_user.username}" if message.from_user.username else "не указан",
+                profile=profile,
+            ),
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Одобрить", callback_data=f"name_approve:{message.from_user.id}"),
                 InlineKeyboardButton(text="Отклонить", callback_data=f"name_reject:{message.from_user.id}"),
@@ -648,6 +662,47 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await state.update_data(direct=direct, header=1, columns=(1,))
         await state.set_state(Dialog.title)
         await message.answer(messages.render("replies.add_3"))
+
+    @router.message(F.text == "Добавить лист")
+    @router.message(Command("addtab"))
+    async def add_tab(message: Message, state: FSMContext) -> None:
+        """Offer existing Google workbooks for adding newly discovered tabs."""
+        if message.from_user.id != db.admin_id():
+            await message.answer(messages.render("replies.add_1"))
+            return
+        await state.clear()
+        workbooks = db.extension_workbooks()
+        if not workbooks:
+            await message.answer(messages.render("replies.add_tab_empty"))
+            return
+        lines, actions = [bold("Выбери существующую таблицу"), ""], {}
+        for workbook in workbooks:
+            anchor = f"#{workbook['id']}:"
+            lines.append(f"{anchor} {table_link(workbook['title'], workbook['url'])}")
+            actions[anchor] = [("Добавить лист", f"extend:{workbook['id']}")]
+        await send_view(message, db, lines, admin=True, actions=actions)
+
+    @router.callback_query(F.data.regexp(r"^extend:\d+$"))
+    async def extend_workbook(callback: CallbackQuery, state: FSMContext) -> None:
+        """Discover unregistered tabs in the selected approved workbook."""
+        if callback.from_user.id != db.admin_id():
+            await callback.answer(messages.render("replies.add_1"), show_alert=True)
+            return
+        source = db.extension_source(int(callback.data.split(":")[1]))
+        if source is None:
+            await callback.answer(messages.render("replies.add_tab_missing"), show_alert=True)
+            return
+        await callback.answer()
+        if not isinstance(callback.message, Message):
+            return
+        await state.clear()
+        await state.update_data(title=source["title"], direct=True, extension_source=source["id"])
+        try:
+            await begin_workbook(callback.message, state, source["url"],
+                                 existing_urls=set(source["existing_urls"]))
+        except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
+            await state.clear()
+            await callback.message.answer(messages.render("replies.add_tab_failed", reason=str(exc)))
 
     @router.message(Command("layout"))
     async def layout(message: Message, state: FSMContext) -> None:
@@ -1048,10 +1103,23 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def begin_workbook(message: Message, state: FSMContext, url: str) -> None:
+    async def begin_workbook(message: Message, state: FSMContext, url: str, *,
+                             existing_urls: set[str] | None = None) -> None:
         """Start guided workbook setup from a sheet URL."""
-        tabs = await discover_sheets(monitor.session, url)
-        await state.update_data(tabs=tabs, selected=list(range(len(tabs))), setup_token=secrets.token_hex(8),
+        all_tabs = await discover_sheets(monitor.session, url)
+        tabs = [tab for tab in all_tabs if sheet_url(tab["url"]) not in existing_urls] if existing_urls else all_tabs
+        if not tabs:
+            await state.clear()
+            await message.answer(messages.render("replies.add_tab_none"))
+            return
+        data = await state.get_data()
+        title = data.get("title", "")
+        if existing_urls and len(existing_urls) == 1:
+            old_tab = next((tab for tab in all_tabs if sheet_url(tab["url"]) in existing_urls), None)
+            if old_tab and title.endswith(" · " + old_tab["name"]):
+                title = title.removesuffix(" · " + old_tab["name"])
+        await state.update_data(title=title, tabs=tabs, all_tabs=all_tabs, selected=list(range(len(tabs))),
+                                setup_token=secrets.token_hex(8),
                                 tab_page=0, configured=[])
         await state.set_state(Dialog.sheet_selection)
         await message.answer(messages.render("replies.begin_workbook_1"),
@@ -1218,7 +1286,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         """Validate and store the current tab configuration."""
         data = await state.get_data()
         tab = data["tabs"][data["current_index"]]
-        title = data["title"] if len(data["tabs"]) == 1 else f"{data['title']} · {tab['name']}"
+        title = (data["title"] if len(data["tabs"]) == 1 and not data.get("extension_source")
+                 else f"{data['title']} · {tab['name']}")
         configured = data["configured"] + [{
             "index": data["current_index"], "title": title, "url": tab["url"],
             "header": data["header"], "columns": data["columns"],

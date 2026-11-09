@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -879,7 +880,7 @@ async def test_columns_are_admin_only_and_require_cached_approved_sheet(dialog_b
     h = dialog_bot
     h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved")
     await h.send("/columns", 123)
-    assert h.replies()[-1] == "Команда доступна админу"
+    assert h.replies()[-1] == "Эта команда недоступна"
     await h.callback("pick_columns:1", 123)
     assert h.replies()[-1] == "Только для админа"
     await h.callback("pick_columns:1")
@@ -977,6 +978,55 @@ async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypa
     assert fetch.await_args.kwargs == {"header_start": 1, "grade_columns": [3, 5]}
     await h.callback(f"worksave:{token}")
     assert len(h.db.all("SELECT * FROM sheets")) == 1
+
+
+async def test_add_tab_to_existing_workbook_uses_only_new_tabs(dialog_bot, monkeypatch):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    base = "https://docs.google.com/spreadsheets/d/existing/edit#gid="
+    tabs = [{"name": "Первый", "url": base + "1"}, {"name": "Второй", "url": base + "2"}]
+    original = h.db.add_sheet("Матан", tabs[0]["url"], 1, (1,), 999, "approved")
+    monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
+    await h.send("/addtab", 999)
+    markup = h.bot.session.await_args.args[1].reply_markup
+    assert markup.inline_keyboard[0][0].callback_data == f"extend:{original}"
+    await h.callback(f"extend:{original}")
+    data = await setup_data(h)
+    assert data["tabs"] == [tabs[1]]
+    assert data["selected"] == [0]
+    await h.callback(f"tabs:{data['setup_token']}:next")
+    assert await h.state(999) == Dialog.sheet_columns.state
+    await h.send("готово", 999)
+    await h.callback(f"worksave:{data['setup_token']}")
+    rows = h.db.all("SELECT id,title,url FROM sheets ORDER BY id")
+    assert [(row["title"], row["url"]) for row in rows] == [
+        ("Матан", tabs[0]["url"]), ("Матан · Второй", tabs[1]["url"])
+    ]
+    assert rows[0]["id"] == original
+    assert len(h.db.all("SELECT * FROM sheet_cache")) == 1
+    assert json.loads(h.db.all("SELECT tabs FROM workbook_watch")[0][0]) == tabs
+    await h.send("/addtab", 999)
+    await h.callback(f"extend:{original}")
+    assert h.replies()[-1] == "Новых листов в этой таблице пока нет"
+    assert await h.state(999) is None
+
+
+async def test_add_tab_rechecks_duplicate_before_saving(dialog_bot, monkeypatch):
+    h = dialog_bot
+    base = "https://docs.google.com/spreadsheets/d/existing/edit#gid="
+    tabs = [{"name": "Первый", "url": base + "1"}, {"name": "Второй", "url": base + "2"}]
+    original = h.db.add_sheet("Матан", tabs[0]["url"], 1, (1,), 999, "approved")
+    monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
+    await h.send("/addtab", 999)
+    await h.callback(f"extend:{original}")
+    token = (await setup_data(h))["setup_token"]
+    await h.callback(f"tabs:{token}:next")
+    await h.send("готово", 999)
+    h.db.add_sheet("Другое имя", tabs[1]["url"], 1, (1,), 999, "approved")
+    await h.callback(f"worksave:{token}")
+    assert len(h.db.all("SELECT * FROM sheets")) == 2
+    assert not h.db.all("SELECT * FROM sheet_cache")
 
 
 async def test_workbook_save_rolls_back_every_sheet_on_conflict(dialog_bot, monkeypatch):

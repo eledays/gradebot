@@ -100,6 +100,28 @@ async def test_invalid_invitation_and_cancel(app):
     assert not app.db.authorized(123)
 
 
+async def test_start_without_invitation_explains_restricted_access(app):
+    await app.send("/start", 123)
+    assert "Доступ к боту ограничен" in app.replies()[-1]
+    assert "@group_admin" in app.replies()[-1]
+    assert not app.db.authorized(123)
+    assert not app.db.has_join_draft(123)
+
+
+async def test_name_request_shows_admin_profile_and_both_names(app):
+    app.db.register(123, "Иванов Иван")
+    await app.send("/name", 123, username="ivanov")
+    await app.send("Петров Петр", 123, username="ivanov")
+    method = app.bot.session.await_args.args[1]
+    assert method.chat_id == 999
+    assert method.parse_mode == "HTML"
+    assert "Иванов Иван" in method.text
+    assert "Петров Петр" in method.text
+    assert "@ivanov" in method.text
+    assert "tg://user?id=123" in method.text
+    assert method.reply_markup.inline_keyboard[0][0].callback_data == "name_approve:123"
+
+
 async def test_revocation_clears_private_data_and_blocks_old_pages(app):
     app.db.register(123, "Иванов Иван")
     with app.db.conn:
@@ -223,7 +245,7 @@ async def test_admin_can_revoke_by_id_and_outsider_cannot(app):
     assert method.reply_markup is None
     await app.send("/revoke", 123)
     assert app.db.authorized(123)
-    assert app.replies()[-1] == "Команда доступна админу"
+    assert app.replies()[-1] == "Эта команда недоступна"
     await app.send("/revoke")
     assert "Отправь ID пользователя" in app.replies()[-1]
     await app.send("не число")

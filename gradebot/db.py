@@ -10,7 +10,7 @@ from .logging_setup import audit
 from .presentation import bold, create_view, table_link
 from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
-from .structure import header_signature
+from .structure import group_sheets, header_signature, sheet_group_title, workbook_url
 
 
 class WorkbookTab(TypedDict):
@@ -41,6 +41,17 @@ class WorkbookDraft(TypedDict):
     url: str
     proposer: NotRequired[int]
     proposal_id: NotRequired[int]
+    extension_source: NotRequired[int]
+    all_tabs: NotRequired[list[WorkbookTab]]
+
+
+class ExtensionWorkbook(TypedDict):
+    """An existing workbook and its tabs already stored in the database."""
+
+    id: int
+    title: str
+    url: str
+    existing_urls: list[str]
 
 
 class DuplicateTitleError(ValueError):
@@ -389,12 +400,45 @@ class Database:
                 (user_id, pages[0], view_id, kind, time.time()),
             )
 
-    def remember_workbook(self, url: str, tabs: list[dict[str, str]]) -> None:
+    def remember_workbook(self, url: str, tabs: list[dict[str, str]], *, replace: bool = False) -> None:
         """Record a workbook and its known tabs."""
-        from .structure import workbook_url
+        if replace:
+            self.conn.execute("INSERT INTO workbook_watch(url,tabs) VALUES(?,?) "
+                              "ON CONFLICT(url) DO UPDATE SET tabs=excluded.tabs",
+                              (workbook_url(url), json.dumps(tabs)))
+        else:
+            self.conn.execute("INSERT OR IGNORE INTO workbook_watch(url,tabs) VALUES(?,?)",
+                              (workbook_url(url), json.dumps(tabs)))
 
-        self.conn.execute("INSERT OR IGNORE INTO workbook_watch(url,tabs) VALUES(?,?)",
-                          (workbook_url(url), json.dumps(tabs)))
+    def extension_workbooks(self) -> list[ExtensionWorkbook]:
+        """List approved workbooks once each for adding new tabs."""
+        return [self._extension_group(group) for group in group_sheets(self.sheets_by_status("approved"))]
+
+    def extension_source(self, sheet_id: int) -> ExtensionWorkbook | None:
+        """Find the approved workbook containing a stored sheet ID."""
+        sheet = self.sheet(sheet_id, "approved")
+        if sheet is None:
+            return None
+        group = [row for row in self.sheets_by_status("approved")
+                 if workbook_url(row["url"]) == workbook_url(sheet["url"])]
+        source = self._extension_group(group)
+        source["id"] = sheet_id
+        return source
+
+    def _extension_group(self, group: list[sqlite3.Row]) -> ExtensionWorkbook:
+        """Build a stable title and URL set for one Google workbook."""
+        first = group[0]
+        title = sheet_group_title(group) or str(first["title"])
+        if len(group) == 1:
+            watch = self.all("SELECT tabs FROM workbook_watch WHERE url=?", (workbook_url(first["url"]),))
+            if watch:
+                for tab in json.loads(watch[0]["tabs"]):
+                    suffix = " · " + tab["name"]
+                    if sheet_url(tab["url"]) == sheet_url(first["url"]) and title.endswith(suffix):
+                        title = title.removesuffix(suffix)
+                        break
+        return {"id": int(first["id"]), "title": title,
+                "url": str(first["url"]), "existing_urls": [sheet_url(row["url"]) for row in group]}
 
     def notification_users(self) -> list[sqlite3.Row]:
         """Activated users with access, including an administrator outside the member list."""
@@ -522,6 +566,13 @@ class Database:
             if not self.conn.in_transaction:
                 self.conn.execute("BEGIN")
             proposal = data.get("proposal_id")
+            extension = data.get("extension_source")
+            if extension:
+                source = self.extension_source(extension)
+                if source is None or workbook_url(source["url"]) != workbook_url(data["all_tabs"][0]["url"]):
+                    raise SheetError("Исходная таблица больше недоступна")
+                if any(sheet_url(item["url"]) in source["existing_urls"] for item in data["configured"]):
+                    raise SheetError("Один из листов уже добавлен")
             if proposal:
                 if self.sheet(int(proposal), "pending") is None:
                     raise SheetError("Предложение уже обработано")
@@ -532,7 +583,8 @@ class Database:
                                item["header_start"], tuple(item["grade_columns"]))
                 self.add_sheet(item["title"], item["url"], item["header"], item["columns"],
                                data.get("proposer", admin_id), "approved", parsed=parsed)
-            self.remember_workbook(data["tabs"][0]["url"], data["tabs"])
+            all_tabs = data.get("all_tabs", data["tabs"])
+            self.remember_workbook(all_tabs[0]["url"], all_tabs, replace=bool(extension))
             for item in configured:
                 self.broadcast_table(item["title"], item["url"])
             if proposal:
