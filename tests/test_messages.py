@@ -21,4 +21,4 @@ def test_catalog_escapes_arguments_and_allows_explicit_html(tmp_path: Path) -> N
 def test_packaged_help_and_welcome_templates() -> None:
     catalog = MessageCatalog()
     assert "<b>Описание</b>" in catalog.render("help.body", period="60 сек")
-    assert "&lt;Иван&gt;" in catalog.render("registration.welcome", name="<Иван>")
+    assert "&lt;Иван&gt;" in catalog.render("registration.welcome", first_name="<Иван>")

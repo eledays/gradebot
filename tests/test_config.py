@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from gradebot.bot import help_message
+from gradebot.bot import given_name, help_message
 from gradebot.db import Database
 
 
@@ -17,6 +17,13 @@ def test_help_displays_actual_interval_and_contact(interval, label):
     assert text.endswith("<i>Кэш ещё не загружен</i>")
     assert "<b>Админ</b>" not in text and "/add" not in text
     assert "/start" not in text
+
+
+def test_greetings_use_given_name_and_escape_html():
+    assert given_name("Иванов Иван Иванович") == "Иван"
+    assert given_name("Петров Петр") == "Петр"
+    assert help_message(60, "", name="Иванов Иван Иванович").startswith("Рад тебя видеть, Иван\n\n")
+    assert help_message(60, "", name="Иванов <Иван>").startswith("Рад тебя видеть, &lt;Иван&gt;\n\n")
 
 
 def test_help_admin_block_and_optional_contact():

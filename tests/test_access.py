@@ -86,7 +86,7 @@ async def test_invitation_registration_and_safe_welcome(app):
     await app.send("Иванов Иван", 123)
     assert app.db.authorized(123)
     assert app.db.user_name(123) == "Иванов Иван"
-    assert any("Добро пожаловать" in reply for reply in app.replies())
+    assert any("Добро пожаловать, Иван!" in reply for reply in app.replies())
 
 
 async def test_invalid_invitation_and_cancel(app):

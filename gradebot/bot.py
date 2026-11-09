@@ -49,6 +49,12 @@ from .sheets import (
 from .structure import group_sheets, header_signature, sheet_group_title
 
 
+def given_name(full_name: str) -> str:
+    """Return the given name from a surname-first Russian full name."""
+    parts = full_name.split()
+    return parts[1] if len(parts) >= 2 else parts[0] if parts else ""
+
+
 def help_message(interval: int, contact_username: str, *, admin: bool = False,
                  name: str | None = None, fetched_at: float | None = None) -> str:
     """Render the user help page from editable HTML templates."""
@@ -58,9 +64,11 @@ def help_message(interval: int, contact_username: str, *, admin: bool = False,
         period = f"{interval // 60} мин"
     else:
         period = f"{interval} сек"
-    person = f", {name}" if name else ""
-    parts = [messages.render("help.greeting", person=person),
-             messages.render("help.body", period=period)]
+    greeting = (
+        messages.render("help.greeting", person=given_name(name))
+        if name else messages.render("help.greeting_anonymous")
+    )
+    parts = [greeting, messages.render("help.body", period=period)]
     if admin:
         parts.append(messages.render("help.admin"))
     contact = contact_username.strip().lstrip("@")
@@ -247,9 +255,11 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         first = not registered(user_id)
         db.activate(user_id)
         name = db.member_name(user_id)
+        if name is None:
+            raise RuntimeError("Authorized member has no registered name")
         reports = await monitor.inspect_user(user_id, baseline=first)
         await message.answer(
-            messages.render("registration.returning", name=name),
+            messages.render("registration.returning", first_name=given_name(name)),
             parse_mode="HTML",
             reply_markup=menu(user_id == db.admin_id()),
         )
@@ -284,7 +294,11 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         await state.clear()
         reports = await monitor.inspect_user(message.from_user.id, baseline=True)
-        await message.answer(messages.render("registration.welcome", name=name), parse_mode="HTML", reply_markup=menu())
+        await message.answer(
+            messages.render("registration.welcome", first_name=given_name(name)),
+            parse_mode="HTML",
+            reply_markup=menu(),
+        )
         summary = registration_summary(reports)
         if summary:
             await send_view(message, db, safe_lines(summary))

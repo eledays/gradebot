@@ -166,7 +166,7 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
     await h.send("/start")
     assert await h.state() is None
     assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
-    assert "Привет, Иванов Иван" in h.replies()[0]
+    assert "Привет, Иван" in h.replies()[0]
     assert "- Физика" in h.replies()[-1]
     assert "Матан" not in h.replies()[-1]
     h.monitor.fetch.assert_not_called()
@@ -701,7 +701,7 @@ async def test_start_uses_assigned_name_and_opens_simple_menu(dialog_bot):
     )
     await h.send("/start")
     assert len(h.replies()) == 1
-    assert h.replies()[0].startswith("Привет, Иванов Иван!")
+    assert h.replies()[0].startswith("Привет, Иван!")
     method = h.bot.session.await_args.args[1]
     labels = [button.text for row in method.reply_markup.keyboard for button in row]
     assert "Мои оценки" in labels and "Таблицы" in labels
@@ -724,11 +724,11 @@ async def test_help_greets_saved_name_and_shows_latest_approved_cache(dialog_bot
             )
     await h.send("/help")
     text = h.replies()[-1]
-    assert text.startswith("Рад тебя видеть, Иванов Иван\n\n")
+    assert text.startswith("Рад тебя видеть, Иван\n\n")
     assert text.endswith("<i>Кэш устарел · Последнее обновление кэша: 15.11.2023 02:13:20 МСК</i>")
     h.db.register(123, "Петров Петр")
     await h.send("/help")
-    assert h.replies()[-1].startswith("Рад тебя видеть, Петров Петр\n\n")
+    assert h.replies()[-1].startswith("Рад тебя видеть, Петр\n\n")
 
 
 async def test_refresh_is_admin_only_and_reports_failures(dialog_bot):
