@@ -61,7 +61,8 @@ ENUMS = {
 logger = logging.getLogger("gradebot.audit")
 
 
-def error_category(error):
+def error_category(error: BaseException) -> str:
+    """Classify an exception without exposing its message."""
     for category, types in [
         ("timeout", (TimeoutError,)),
         ("telegram", (TelegramAPIError,)),
@@ -75,7 +76,8 @@ def error_category(error):
     return "internal"
 
 
-def safe_fields(fields):
+def safe_fields(fields: object) -> dict[str, int | float | bool | str]:
+    """Keep only approved non-sensitive audit fields."""
     if not isinstance(fields, dict):
         return {}
     return {
@@ -93,7 +95,9 @@ def safe_fields(fields):
     }
 
 
-def audit(event, *, level=logging.INFO, error=None, **fields):
+def audit(event: str, *, level: int = logging.INFO, error: BaseException | None = None,
+          **fields: object) -> None:
+    """Record a structured operational event."""
     if not isinstance(event, str) or event not in EVENTS:
         raise ValueError("Unknown audit event")
     safe = safe_fields(fields)
@@ -103,7 +107,8 @@ def audit(event, *, level=logging.INFO, error=None, **fields):
 
 
 class SafeFormatter(logging.Formatter):
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
+        """Format an audit record without sensitive details."""
         try:
             timestamp = datetime.fromtimestamp(record.created, UTC).isoformat(timespec="seconds")
             event = getattr(record, "audit_event", None)
@@ -122,12 +127,14 @@ class SafeFormatter(logging.Formatter):
 
 
 class SafeStreamHandler(logging.StreamHandler):
-    def handleError(self, record):
+    def handleError(self, record: logging.LogRecord) -> None:
         # The standard handler prints raw message/args when formatting or writing fails.
+        """Suppress logging failures without exposing the original record."""
         return
 
 
-def configure_logging(level="INFO"):
+def configure_logging(level: str = "INFO") -> None:
+    """Install the operational audit logging configuration."""
     if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
         raise ValueError("LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
     handler = SafeStreamHandler()

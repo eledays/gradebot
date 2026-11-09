@@ -1,136 +1,113 @@
 import json
-import re
 import sqlite3
 import time
+from collections.abc import Iterable, Sequence
 from contextlib import nullcontext
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 from .logging_setup import audit
 from .presentation import bold, create_view, table_link
+from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
 from .structure import header_signature
+
+
+class WorkbookTab(TypedDict):
+    """A discoverable tab in a Google workbook."""
+
+    name: str
+    url: str
+
+
+class ConfiguredSheet(TypedDict):
+    """A validated tab selected for storage."""
+
+    title: str
+    url: str
+    rows: list[list[str]]
+    header: int
+    header_start: int | None
+    columns: list[int]
+    grade_columns: list[int]
+
+
+class WorkbookDraft(TypedDict):
+    """Validated workbook setup persisted by the database layer."""
+
+    configured: list[ConfiguredSheet]
+    tabs: list[WorkbookTab]
+    title: str
+    url: str
+    proposer: NotRequired[int]
+    proposal_id: NotRequired[int]
 
 
 class DuplicateTitleError(ValueError):
     pass
 
 
-def normalized_title(title):
+def normalized_title(title: str) -> str:
+    """Normalize a sheet title for duplicate detection."""
     return " ".join(title.casefold().replace("ё", "е").split())
 
 
 class Database:
-    def __init__(self, path: str):
+    def __init__(self, path: str) -> None:
+        """Open the database and apply additive schema migrations."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript("""
-        PRAGMA foreign_keys=ON;
-        PRAGMA journal_mode=WAL;
-        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS members(
-          id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS invitations(
-          token TEXT PRIMARY KEY, expires_at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS blocked_users(id INTEGER PRIMARY KEY);
-        CREATE TABLE IF NOT EXISTS registration_drafts(user_id INTEGER PRIMARY KEY, token TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS name_requests(
-          user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS sheets(
-          id INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
-          header_row INTEGER NOT NULL, name_columns TEXT NOT NULL,
-          proposer INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
-        CREATE TABLE IF NOT EXISTS workbook_watch(
-          url TEXT PRIMARY KEY, tabs TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS sheet_structure(
-          sheet_id INTEGER PRIMARY KEY REFERENCES sheets(id) ON DELETE CASCADE,
-          signature TEXT NOT NULL, invalid INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS snapshots(
-          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-          sheet_id INTEGER REFERENCES sheets(id) ON DELETE CASCADE,
-          grades TEXT NOT NULL, PRIMARY KEY(user_id,sheet_id));
-        CREATE TABLE IF NOT EXISTS outbox(
-          id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, text TEXT NOT NULL,
-          status TEXT NOT NULL DEFAULT 'pending');
-        CREATE TABLE IF NOT EXISTS sheet_cache(
-          sheet_id INTEGER PRIMARY KEY REFERENCES sheets(id) ON DELETE CASCADE,
-          rows TEXT NOT NULL, fetched_at REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS views(
-          id TEXT PRIMARY KEY, owner INTEGER NOT NULL, pages TEXT NOT NULL,
-          admin INTEGER NOT NULL DEFAULT 0, actions TEXT NOT NULL DEFAULT '[]');
-        """)
+        initialize_database(self.conn)
 
-        existing = {row["name"] for row in self.all("PRAGMA table_info(outbox)")}
-        for column, definition in [
-            ("view_id", "TEXT"),
-            ("kind", "TEXT NOT NULL DEFAULT 'grades'"),
-            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
-            ("next_attempt", "REAL NOT NULL DEFAULT 0"),
-            ("created_at", "REAL NOT NULL DEFAULT 0"),
-        ]:
-            if column not in existing:
-                self.conn.execute(f"ALTER TABLE outbox ADD COLUMN {column} {definition}")
-        if "notifications" not in {row["name"] for row in self.all("PRAGMA table_info(users)")}:
-            self.conn.execute("ALTER TABLE users ADD COLUMN notifications INTEGER NOT NULL DEFAULT 1")
-        if "created_at" not in {row["name"] for row in self.all("PRAGMA table_info(views)")}:
-            self.conn.execute("ALTER TABLE views ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
-        if "parser_options" not in {row["name"] for row in self.all("PRAGMA table_info(sheets)")}:
-            self.conn.execute("ALTER TABLE sheets ADD COLUMN parser_options TEXT NOT NULL DEFAULT '{}'")
-        # Migrate CSV URLs without producing duplicate logical sheets.
-        with self.conn:
-            # Never reuse IDs referenced by old Telegram moderation buttons.
-            maximum = self.all("SELECT COALESCE(MAX(id),0) AS n FROM sheets")[0]["n"]
-            for view in self.all("SELECT actions FROM views"):
-                for match in re.finditer(r"(?:approve|reject|configure):(\d+)", view["actions"]):
-                    maximum = max(maximum, int(match[1]))
-            self.conn.execute(
-                "INSERT INTO settings VALUES('sheet_sequence',?) ON CONFLICT(key) "
-                "DO UPDATE SET value=MAX(CAST(settings.value AS INTEGER),CAST(excluded.value AS INTEGER))",
-                (str(maximum),),
-            )
-            for row in self.all("SELECT id,url FROM sheets"):
-                self.conn.execute("UPDATE sheets SET url=? WHERE id=?", (sheet_url(row["url"]), row["id"]))
-
-    def execute(self, sql, args=()):
-        with self.conn:
+    def execute(self, sql: str, args: Sequence[object] = ()) -> sqlite3.Cursor:
+        """Execute a statement and commit it outside an existing transaction."""
+        with nullcontext() if self.conn.in_transaction else self.conn:
             return self.conn.execute(sql, args)
 
-    def all(self, sql, args=()):
+    def all(self, sql: str, args: Sequence[object] = ()) -> list[sqlite3.Row]:
+        """Fetch all rows for a read-only query."""
         return self.conn.execute(sql, args).fetchall()
 
-    def admin_id(self):
+    def admin_id(self) -> int | None:
+        """Return the configured administrator ID."""
         row = self.conn.execute("SELECT value FROM settings WHERE key='admin'").fetchone()
         return int(row[0]) if row else None
 
-    def register(self, user_id, name):
+    def register(self, user_id: int, name: str) -> None:
         """Internal administrator/test helper."""
         self.grant_members([(user_id, "", name)])
         self.activate(user_id)
 
-    def authorized(self, user_id):
+    def authorized(self, user_id: int) -> bool:
+        """Check whether a user may interact with the bot."""
         return user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
 
-    def blocked(self, user_id):
+    def blocked(self, user_id: int) -> bool:
+        """Check whether a user is denied access."""
         return bool(self.all("SELECT 1 FROM blocked_users WHERE id=?", (user_id,)))
 
-    def create_invitation(self, lifetime=86400):
+    def create_invitation(self, lifetime: int = 86400) -> str:
+        """Create an expiring shared invitation token."""
         import secrets
         token = secrets.token_urlsafe(24)
         self.execute("INSERT INTO invitations VALUES(?,?)", (token, time.time() + lifetime))
         return token
 
-    def invitation_valid(self, token):
+    def invitation_valid(self, token: str) -> bool:
+        """Check whether an invitation is still usable."""
         return bool(self.all("SELECT 1 FROM invitations WHERE token=? AND expires_at>?", (token, time.time())))
 
-    def begin_join(self, user_id, token):
+    def begin_join(self, user_id: int, token: str) -> bool:
+        """Save a pending invitation for name entry."""
         if self.blocked(user_id) or not self.invitation_valid(token):
             return False
         self.execute("INSERT INTO registration_drafts VALUES(?,?) ON CONFLICT(user_id) "
                      "DO UPDATE SET token=excluded.token", (user_id, token))
         return True
 
-    def join(self, user_id, username, name, token):
+    def join(self, user_id: int, username: str | None, name: str, token: str) -> bool:
+        """Activate a member after validating the invitation again."""
         with self.conn:
             if self.blocked(user_id) or not self.invitation_valid(token):
                 return False
@@ -143,7 +120,8 @@ class Database:
             self.conn.execute("DELETE FROM registration_drafts WHERE user_id=?", (user_id,))
         return True
 
-    def change_name(self, user_id, name):
+    def change_name(self, user_id: int, name: str) -> bool:
+        """Update a member name and clear stale grade comparisons."""
         with self.conn:
             result = self.conn.execute("UPDATE members SET name=? WHERE id=?", (name, user_id))
             if result.rowcount:
@@ -151,14 +129,16 @@ class Database:
                 self.conn.execute("DELETE FROM name_requests WHERE user_id=?", (user_id,))
         return bool(result.rowcount)
 
-    def request_name(self, user_id, name):
+    def request_name(self, user_id: int, name: str) -> None:
+        """Save a name change request for administrator review."""
         self.execute(
             "INSERT INTO name_requests VALUES(?,?,?) ON CONFLICT(user_id) "
             "DO UPDATE SET name=excluded.name,created_at=excluded.created_at",
             (user_id, name, time.time()),
         )
 
-    def block(self, user_id):
+    def block(self, user_id: int) -> bool:
+        """Prevent a user from joining and clear their private data."""
         if user_id == self.admin_id():
             return False
         with self.conn:
@@ -168,7 +148,8 @@ class Database:
             self.conn.execute("DELETE FROM registration_drafts WHERE user_id=?", (user_id,))
         return True
 
-    def grant_members(self, entries):
+    def grant_members(self, entries: Iterable[tuple[int, str, str]]) -> None:
+        """Grant access to the supplied members."""
         count = 0
         with self.conn:
             for user_id, username, name in entries:
@@ -183,7 +164,8 @@ class Database:
         if count:
             audit("members_granted", count=count)
 
-    def activate(self, user_id):
+    def activate(self, user_id: int) -> bool:
+        """Create an active user record from a member."""
         member = self.all("SELECT name FROM members WHERE id=?", (user_id,))
         if not member:
             return False
@@ -191,7 +173,8 @@ class Database:
             self._save_name(user_id, member[0]["name"])
         return True
 
-    def _save_name(self, user_id, name):
+    def _save_name(self, user_id: int, name: str) -> None:
+        """Upsert an active name and invalidate stale grade state."""
         old = self.conn.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
         self.conn.execute(
             "INSERT INTO users(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
@@ -209,7 +192,8 @@ class Database:
                 "DELETE FROM outbox WHERE user_id=? AND status='pending' AND kind='grades'", (user_id,)
             )
 
-    def revoke(self, user_id):
+    def revoke(self, user_id: int) -> bool:
+        """Remove a member, their active state, and queued messages."""
         with self.conn:
             result = self.conn.execute("DELETE FROM members WHERE id=?", (user_id,))
             self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
@@ -218,7 +202,8 @@ class Database:
         audit("member_revoked", count=int(bool(result.rowcount)))
         return bool(result.rowcount)
 
-    def toggle_notifications(self, user_id):
+    def toggle_notifications(self, user_id: int) -> bool:
+        """Toggle grade notifications and discard queued grades when disabled."""
         with self.conn:
             self.conn.execute("UPDATE users SET notifications=1-notifications WHERE id=?", (user_id,))
             enabled = self.all("SELECT notifications FROM users WHERE id=?", (user_id,))[0][0]
@@ -228,7 +213,8 @@ class Database:
                 )
         return bool(enabled)
 
-    def cleanup(self):
+    def cleanup(self) -> None:
+        """Remove expired invitations, views, and delivered messages."""
         cutoff = time.time() - 30 * 86400
         with self.conn:
             self.conn.execute("DELETE FROM invitations WHERE expires_at<?", (time.time(),))
@@ -240,11 +226,14 @@ class Database:
                 (cutoff,),
             )
 
-    def title_exists(self, title):
+    def title_exists(self, title: str) -> bool:
+        """Find a sheet with the same normalized title."""
         key = normalized_title(title)
         return any(normalized_title(row["title"]) == key for row in self.all("SELECT title FROM sheets"))
 
-    def add_sheet(self, title, url, header_row, columns, proposer, status, *, parsed=None, notify=False):
+    def add_sheet(self, title: str, url: str, header_row: int, columns: Sequence[int],
+                  proposer: int, status: str, *, parsed: Sheet | None = None, notify: bool = False) -> int:
+        """Create a sheet and optionally queue a moderation or table message."""
         url = sheet_url(url)
         with nullcontext() if self.conn.in_transaction else self.conn:
             if self.title_exists(title):
@@ -278,7 +267,8 @@ class Database:
         audit("sheet_added", sheet_id=sheet_id)
         return sheet_id
 
-    def update_grade_columns(self, sheet_id, columns, *, expected_options, expected_signature):
+    def update_grade_columns(self, sheet_id: int, columns: Sequence[int], *,
+                             expected_options: str, expected_signature: dict[str, object]) -> None:
         """Save selection and preserve comparisons for columns that remain enabled."""
         with self.conn:
             sheets = self.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
@@ -312,7 +302,9 @@ class Database:
             self.conn.execute("UPDATE sheets SET parser_options=? WHERE id=?",
                               (json.dumps(options), sheet_id))
 
-    def snapshot(self, user_id, sheet_id, grades, notifications):
+    def snapshot(self, user_id: int, sheet_id: int, grades: dict[str, str],
+                 notifications: Sequence[str]) -> None:
+        """Persist grades and queue detected changes."""
         with self.conn:
             self.conn.execute(
                 "INSERT INTO snapshots VALUES(?,?,?) ON CONFLICT(user_id,sheet_id) "
@@ -322,14 +314,16 @@ class Database:
             for text in notifications:
                 self.queue(user_id, text.splitlines(), kind="grades")
 
-    def cache(self, sheet_id, parsed, fetched_at=None):
+    def cache(self, sheet_id: int, parsed: Sheet, fetched_at: float | None = None) -> None:
+        """Persist the latest successfully parsed sheet rows."""
         self.conn.execute(
             "INSERT INTO sheet_cache VALUES(?,?,?) ON CONFLICT(sheet_id) "
             "DO UPDATE SET rows=excluded.rows,fetched_at=excluded.fetched_at",
             (sheet_id, json.dumps(parsed.rows), time.time() if fetched_at is None else fetched_at),
         )
 
-    def queue(self, user_id, lines, *, kind="grades", actions=None, admin=False):
+    def queue(self, user_id: int, lines: Sequence[str], *, kind: str = "grades",
+              actions: object = None, admin: bool = False) -> None:
         """Enqueue a notification and its view in the current transaction."""
         with nullcontext() if self.conn.in_transaction else self.conn:
             if not self.conn.in_transaction:
@@ -340,13 +334,14 @@ class Database:
                 (user_id, pages[0], view_id, kind, time.time()),
             )
 
-    def remember_workbook(self, url, tabs):
+    def remember_workbook(self, url: str, tabs: list[dict[str, str]]) -> None:
+        """Record a workbook and its known tabs."""
         from .structure import workbook_url
 
         self.conn.execute("INSERT OR IGNORE INTO workbook_watch(url,tabs) VALUES(?,?)",
                           (workbook_url(url), json.dumps(tabs)))
 
-    def notification_users(self):
+    def notification_users(self) -> list[sqlite3.Row]:
         """Activated users with access, including an administrator outside the member list."""
         return self.all(
             "SELECT u.* FROM users u WHERE u.id=? "
@@ -354,7 +349,8 @@ class Database:
             (self.admin_id(),),
         )
 
-    def broadcast_table(self, title, url):
+    def broadcast_table(self, title: str, url: str) -> None:
+        """Queue a new-table announcement for active users."""
         for user in self.notification_users():
             self.queue(
                 user["id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
@@ -464,7 +460,7 @@ class Database:
                        "", table_link(sheet["title"], sheet["url"])], kind="moderation")
         return True
 
-    def save_workbook(self, data: dict[str, object], admin_id: int) -> None:
+    def save_workbook(self, data: WorkbookDraft, admin_id: int) -> None:
         """Save configured tabs and resolve their proposal in one transaction."""
         with self.conn:
             if not self.conn.in_transaction:
@@ -511,5 +507,6 @@ class Database:
         """Return identifiers that still need moderation."""
         return {int(row["id"]) for row in self.all("SELECT id FROM sheets WHERE status='pending'")}
 
-    def close(self):
+    def close(self) -> None:
+        """Close the SQLite connection."""
         self.conn.close()

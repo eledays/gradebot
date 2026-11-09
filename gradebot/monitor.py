@@ -2,14 +2,19 @@ import asyncio
 import json
 import logging
 import re
+import sqlite3
 import time
 from datetime import datetime
 from decimal import Decimal
+from typing import TypedDict
 from zoneinfo import ZoneInfo
 
+import aiohttp
+from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import LinkPreviewOptions
 
+from .db import Database
 from .logging_setup import audit
 from .presentation import bold, paginate, safe_lines, table_link, view_markup
 from .sheets import Sheet, discover_sheets, fetch_sheet
@@ -17,14 +22,40 @@ from .structure import (
     group_sheets,
     header_signature,
     sheet_group_title,
-    sheet_item_title,
     structure_message,
     workbook_changes,
     workbook_url,
 )
 
 
-def cache_caption(report, label="Последнее обновление"):
+class CacheState(TypedDict):
+    """Timestamp and freshness used by cache captions."""
+
+    fetched_at: float | None
+    stale: bool
+
+
+class GradeReport(CacheState):
+    """Cached grades and lookup status for one user and sheet."""
+
+    sheet_id: int
+    title: str
+    url: str
+    status: str
+    grades: dict[str, str]
+
+
+class ScanResult(TypedDict):
+    """Counters returned by a completed refresh."""
+
+    updated: int
+    failed: list[str]
+    notifications: int
+    structure_notifications: int
+
+
+def cache_caption(report: CacheState, label: str = "Последнее обновление") -> str:
+    """Format cache freshness and update time for Telegram HTML."""
     timestamp = report["fetched_at"]
     if timestamp is None:
         return "<i>Кэш ещё не загружен</i>"
@@ -33,7 +64,9 @@ def cache_caption(report, label="Последнее обновление"):
     return f"<i>{prefix}{label}: {date}</i>"
 
 
-def format_grades(report, *, limit=3, include_caption=True):
+def format_grades(report: GradeReport, *, limit: int | None = 3,
+                  include_caption: bool = True) -> str:
+    """Format one student grade report as safe Telegram HTML."""
     lines = [f"<b>{table_link(report['title'], report['url'])}</b>"]
     if report["status"] == "found":
         filled = [(label, value) for label, value in report["grades"].items() if value.strip()]
@@ -69,7 +102,8 @@ def format_grades(report, *, limit=3, include_caption=True):
     return "\n".join(lines).replace("<pre>\n", "<pre>").replace("\n</pre>", "</pre>")
 
 
-def subject_pages(report):
+def subject_pages(report: GradeReport) -> list[str]:
+    """Split a complete subject report into Telegram-sized pages."""
     if report["status"] != "found":
         return [format_grades(report)]
     grades = list(reversed([(k, v) for k, v in report["grades"].items() if v.strip()]))
@@ -84,7 +118,9 @@ def subject_pages(report):
 
 
 class Monitor:
-    def __init__(self, db, session, bot, interval=60):
+    def __init__(self, db: Database, session: aiohttp.ClientSession | None,
+                 bot: Bot, interval: int = 60) -> None:
+        """Initialize this component and its state."""
         self.db, self.session, self.bot = db, session, bot
         self.interval = interval
         self.lock = asyncio.Lock()
@@ -95,7 +131,7 @@ class Monitor:
         deadline = db.all("SELECT value FROM settings WHERE key='delivery_after'")
         self.delivery_after = float(deadline[0][0]) if deadline else 0.0
 
-    async def inspect_user(self, user_id, *, baseline=False):
+    async def inspect_user(self, user_id: int, *, baseline: bool = False) -> list[GradeReport]:
         """Read persisted cache only; never wait for Google or mutate it on /grades."""
         user = self.db.all("SELECT * FROM users WHERE id=?", (user_id,))[0]
         reports = []
@@ -126,23 +162,30 @@ class Monitor:
             )
         return reports
 
-    async def check_user(self, user_id, name=None):
+    async def check_user(self, user_id: int, name: str | None = None) -> list[str]:
+        """Inspect a user while saving the initial comparison snapshot."""
         if name is not None:
             self.db.register(user_id, name)
         return [format_grades(r) for r in await self.inspect_user(user_id, baseline=True)]
 
-    async def fetch(self, sheet):
+    async def fetch(self, sheet: sqlite3.Row) -> Sheet:
+        """Fetch and parse an approved sheet."""
+        if self.session is None:
+            raise RuntimeError("Google Sheets session is not available")
         return await fetch_sheet(
             self.session, sheet["url"], sheet["header_row"], json.loads(sheet["name_columns"]),
             **json.loads(sheet["parser_options"])
         )
 
-    async def discover(self, url):
+    async def discover(self, url: str) -> list[dict[str, str]] | None:
+        """Discover tabs from a Google workbook URL."""
         if self.session is None:
             return None
         return await discover_sheets(self.session, url)
 
-    def record_structure(self, sheet, rows, invalid=False):
+    def record_structure(self, sheet: sqlite3.Row, rows: list[list[str]],
+                         invalid: bool = False) -> int:
+        """Compare sheet structure and queue an administrator alert if changed."""
         options = json.loads(sheet["parser_options"])
         signature = header_signature(rows, sheet["header_row"], options.get("header_start"))
         previous = self.db.all("SELECT * FROM sheet_structure WHERE sheet_id=?", (sheet["id"],))
@@ -164,7 +207,8 @@ class Monitor:
         )
         return int(changed and admin is not None)
 
-    async def scan(self, *, scheduled=False):
+    async def scan(self, *, scheduled: bool = False) -> ScanResult | None:
+        """Refresh cached sheets and queue detected changes."""
         async with self.scan_lock:
             # A manual refresh may have moved the deadline while the scheduler waited.
             if scheduled and time.monotonic() < self.next_refresh:
@@ -188,7 +232,8 @@ class Monitor:
                 self.next_refresh = time.monotonic() + self.interval
                 self.schedule_changed.set()
 
-    async def _scan(self):
+    async def _scan(self) -> ScanResult:
+        """Fetch all sheets and update persistent state under the monitor lock."""
         fetched, failed, structures, workbooks = [], [], [], []
         notifications = 0
         sheets = self.db.all("SELECT * FROM sheets WHERE status='approved'")
@@ -281,11 +326,12 @@ class Monitor:
                         if not changed:
                             continue
                         subject = sheet_group_title(group)
-                        if subject:
-                            lines.append(bold(subject))
+                        prefix = subject + " · " if subject else ""
+                        if subject or len(group) > 1:
+                            lines.append(bold(subject or "Листы одной таблицы"))
                         for sheet in changed:
-                            title = sheet_item_title(sheet) if subject else sheet["title"]
-                            lines.extend(safe_lines(title) if subject else [bold(title)])
+                            title = sheet["title"].removeprefix(prefix)
+                            lines.extend(safe_lines(title) if subject or len(group) > 1 else [bold(title)])
                             for column, value in changes[sheet["id"]]:
                                 lines.extend(safe_lines(f"- {column}: {value}"))
                             lines.append("")
@@ -296,7 +342,8 @@ class Monitor:
         return {"updated": len(fetched), "failed": failed, "notifications": notifications,
                 "structure_notifications": structure_notifications}
 
-    async def deliver(self):
+    async def deliver(self) -> None:
+        """Send pending notifications with retry and failure handling."""
         async with self.delivery_lock:
             if time.time() < self.delivery_after:
                 return
@@ -363,7 +410,8 @@ class Monitor:
                     self.db.execute("UPDATE outbox SET status='sent' WHERE id=?", (item["id"],))
                     audit("notification_sent", level=logging.DEBUG, notification_id=item["id"])
 
-    async def run_delivery(self):
+    async def run_delivery(self) -> None:
+        """Poll the outbox independently of sheet refreshes."""
         while True:
             try:
                 await self.deliver()
@@ -372,7 +420,8 @@ class Monitor:
                 audit("delivery_failed", level=logging.ERROR, error=exc)
             await asyncio.sleep(2)
 
-    async def run(self, interval):
+    async def run(self, interval: int) -> None:
+        """Schedule periodic sheet refreshes."""
         self.interval = interval
         while True:
             self.schedule_changed.clear()

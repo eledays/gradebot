@@ -1,6 +1,7 @@
 """Hold a process lock for the database while polling Telegram."""
 
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -10,8 +11,9 @@ class AlreadyRunningError(RuntimeError):
 
 
 @contextmanager
-def database_run_lock(path):
+def database_run_lock(path: str | Path) -> Iterator[None]:
     # Deployment is on POSIX. Keep the lock file: unlinking it permits competing inodes.
+    """Prevent two bot processes from using the same database."""
     import fcntl
 
     lock_path = Path(str(Path(path).resolve()) + ".run.lock")

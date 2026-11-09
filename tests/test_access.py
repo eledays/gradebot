@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import SimpleEventIsolation
-from aiogram.types import CallbackQuery, Chat, Contact, Message, SharedUser, Update, User, UsersShared
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
-from gradebot.bot import Dialog, create_router
+from gradebot.bot import create_router
 from gradebot.db import Database
 from gradebot.monitor import Monitor
 from gradebot.presentation import create_view, view_markup
@@ -64,103 +64,40 @@ def app(tmp_path):
                 call.args[1].text for call in bot.session.await_args_list if hasattr(call.args[1], "text")
             ]
 
-        async def add_contact(self, user_id=123, name="Иванов Иван"):
-            await self.send(contact=Contact(user_id=user_id, phone_number="+70000000000", first_name="Test"))
-            await self.send(name)
-
-        async def confirm(self):
-            await self.send("Сохранить всех")
-
     instance = App()
     instance.db, instance.bot, instance.monitor = db, bot, monitor
     yield instance
     db.close()
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["/start", "/grades", "/tables", "/help", "/suggest", "/access", "/members", "/name", "Мои оценки"],
-)
-async def test_outsider_cannot_read_or_register(app, text):
+@pytest.mark.parametrize("text", ["/grades", "/tables", "/help", "/suggest", "/members", "/name", "Мои оценки"])
+async def test_outsider_cannot_read_private_data(app, text):
     await app.send(text, 123, "ivanov")
     assert "Доступ закрыт" in app.replies()[-1]
     assert not app.db.all("SELECT * FROM users")
-    assert not app.db.all("SELECT * FROM members")
 
 
-async def test_contacts_accumulate_and_access_is_pinned_to_id(app):
-    await app.send("/access")
-    await app.add_contact(123, "Иванов Иван")
-    await app.add_contact(456, "Петров Петр")
-    assert await app.state() == Dialog.access_input.state
-    assert not app.db.all("SELECT * FROM members")
-    await app.confirm()
-    assert len(app.db.all("SELECT * FROM members")) == 2
-    assert not app.db.all("SELECT * FROM users")
-    await app.send("/start", 123, "newusername")
-    assert "Привет, Иванов Иван!" in app.replies()[-2]
-    await app.send("/start", 777, "ivanov")
-    assert "Доступ закрыт" in app.replies()[-1]
-    await app.send("/start", 123)
-    assert "Привет, Иванов Иван!" in app.replies()[-2]
-
-
-async def test_cancel_discards_entire_draft(app):
-    await app.send("/access")
-    await app.add_contact()
-    await app.send("Отмена")
-    await app.confirm()
-    assert not app.db.authorized(123)
-    assert await app.state() is None
-
-
-async def test_repeated_contact_updates_single_draft_row(app):
-    await app.send("/access")
-    await app.add_contact(123, "Иванов Иван")
-    await app.add_contact(123, "Иванов Иван Иванович")
-    await app.confirm()
-    rows = app.db.all("SELECT * FROM members")
-    assert len(rows) == 1
-    assert rows[0]["name"] == "Иванов Иван Иванович"
-
-
-async def test_non_admin_cannot_save_draft(app):
-    app.db.grant_members([(456, "petrov", "Петров Петр")])
-    await app.send("/access")
-    await app.add_contact()
-    await app.send("Сохранить всех", 456)
-    assert not app.db.authorized(123)
-    await app.confirm()
+async def test_invitation_registration_and_safe_welcome(app):
+    token = app.db.create_invitation()
+    await app.send(f"/start {token}", 123, "ivanov")
+    assert "отправь ФИО" in app.replies()[-1]
+    await app.send("Иванов <Иван>", 123)
+    assert "Нужно 2–3 полных слова" in app.replies()[-1]
+    await app.send("Иванов Иван", 123)
     assert app.db.authorized(123)
+    assert app.db.user_name(123) == "Иванов Иван"
+    assert any("Добро пожаловать" in reply for reply in app.replies())
 
 
-async def test_telegram_user_picker_saves_id_before_first_start(app):
-    await app.send("Добавить пользователей")
-    data = await app.context().get_data()
-    await app.send(shared=UsersShared(request_id=data["request_id"], users=[SharedUser(user_id=123)]))
-    assert await app.state() == Dialog.member_name.state
-    await app.send("Иванов Иван")
-    await app.confirm()
-    assert app.db.authorized(123)
-    assert not app.db.all("SELECT * FROM users")
-    await app.send("/start", 123)
-    assert app.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
-
-
-async def test_old_picker_request_is_rejected(app):
-    await app.send("/access")
-    data = await app.context().get_data()
-    await app.send(shared=UsersShared(request_id=data["request_id"] + 1, users=[SharedUser(user_id=123)]))
-    assert await app.state() == Dialog.access_input.state
+async def test_invalid_invitation_and_cancel(app):
+    await app.send("/start invalid", 123)
+    assert "Ссылка недействительна" in app.replies()[-1]
+    token = app.db.create_invitation()
+    await app.send(f"/start {token}", 123)
+    assert app.db.has_join_draft(123)
+    await app.send("/cancel", 123)
+    assert not app.db.has_join_draft(123)
     assert not app.db.authorized(123)
-
-
-async def test_admin_can_switch_from_table_input_using_menu(app):
-    await app.send("Добавить таблицу")
-    assert await app.state() == Dialog.title.state
-    await app.send("Добавить пользователей")
-    assert await app.state() == Dialog.access_input.state
-    assert not app.db.all("SELECT * FROM sheets")
 
 
 async def test_revocation_clears_private_data_and_blocks_old_pages(app):
@@ -298,102 +235,3 @@ async def test_admin_can_revoke_by_id_and_outsider_cannot(app):
     data = await app.context().get_data()
     await app.click(f"revoke:{data['token']}")
     assert not app.db.authorized(123)
-
-
-async def test_username_import_is_not_supported(app):
-    await app.send("/access")
-    await app.send("@ivanov | Иванов Иван")
-    assert app.replies()[-1] == "Отправь контакт"
-    assert not app.db.all("SELECT * FROM members")
-
-
-async def test_contact_without_id_preserves_draft(app):
-    await app.send("/access")
-    await app.add_contact()
-    await app.send(contact=Contact(phone_number="+70000000000", first_name="Unknown"))
-    assert app.replies()[-1] == "В контакте нет Telegram ID"
-    assert len((await app.context().get_data())["entries"]) == 1
-    await app.confirm()
-    assert app.db.authorized(123)
-
-
-async def test_second_contact_does_not_overwrite_unfinished_name(app):
-    await app.send("/access")
-    await app.send(contact=Contact(user_id=123, phone_number="+70000000000", first_name="First"))
-    await app.send(contact=Contact(user_id=456, phone_number="+70000000001", first_name="Second"))
-    assert app.replies()[-1] == "Контактов в очереди: 2"
-    await app.send("Иванов Иван")
-    assert await app.state() == Dialog.member_name.state
-    await app.send("Петров Петр")
-    await app.confirm()
-    assert app.db.authorized(123)
-    assert app.db.authorized(456)
-
-
-async def test_save_does_not_drop_unfinished_contact(app):
-    await app.send("/access")
-    await app.add_contact()
-    await app.send(contact=Contact(user_id=456, phone_number="+70000000000", first_name="Test"))
-    await app.confirm()
-    assert app.replies()[-1] == "Сначала отправь ФИО"
-    assert not app.db.all("SELECT * FROM members")
-    await app.send("Петров Петр")
-    await app.confirm()
-    assert len(app.db.all("SELECT * FROM members")) == 2
-
-
-async def test_invalid_name_keeps_contact_and_draft(app):
-    await app.send("/access")
-    await app.add_contact()
-    await app.send(contact=Contact(user_id=456, phone_number="+70000000000", first_name="Test"))
-    await app.send("Петр")
-    assert await app.state() == Dialog.member_name.state
-    await app.send("Петров Петр")
-    await app.confirm()
-    assert len(app.db.all("SELECT * FROM members")) == 2
-
-
-async def test_contact_from_non_admin_is_not_added(app):
-    app.db.grant_members([(456, "", "Петров Петр")])
-    await app.send("/access")
-    await app.send(contact=Contact(user_id=123, phone_number="+70000000000", first_name="Test"), user_id=456)
-    assert not app.db.authorized(123)
-    assert not (await app.context().get_data())["entries"]
-
-
-async def test_contacts_can_arrive_as_batch_before_names(app):
-    await app.send("/access")
-    for user_id in (123, 456, 789):
-        await app.send(
-            contact=Contact(user_id=user_id, phone_number="+70000000000", first_name=f"User{user_id}")
-        )
-    assert not app.db.all("SELECT * FROM members")
-    assert len((await app.context().get_data())["queue"]) == 2
-    for name in ("Иванов Иван", "Петров Петр", "Сидоров Сидор"):
-        await app.send(name)
-    assert await app.state() == Dialog.access_input.state
-    await app.confirm()
-    assert [(row["id"], row["name"]) for row in app.db.all("SELECT * FROM members ORDER BY id")] == [
-        (123, "Иванов Иван"),
-        (456, "Петров Петр"),
-        (789, "Сидоров Сидор"),
-    ]
-
-
-async def test_duplicate_queued_contact_does_not_request_name_twice(app):
-    await app.send("/access")
-    for user_id in (123, 456, 456):
-        await app.send(contact=Contact(user_id=user_id, phone_number="+70000000000", first_name="User"))
-    assert app.replies()[-1] == "Контакт уже в очереди"
-    await app.send("Иванов Иван")
-    await app.send("Петров Петр")
-    await app.confirm()
-    assert len(app.db.all("SELECT * FROM members")) == 2
-
-
-async def test_empty_list_is_not_saved(app):
-    await app.send("/access")
-    await app.confirm()
-    assert app.replies()[-1] == "Список пуст"
-    assert await app.state() == Dialog.access_input.state
-    assert not app.db.all("SELECT * FROM members")

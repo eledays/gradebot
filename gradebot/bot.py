@@ -5,7 +5,9 @@ import logging
 import secrets
 import sqlite3
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from html import escape
+from typing import Any, cast
 
 import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -25,11 +27,11 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from .columns import PAGE_SIZE, column_picker
-from .db import DuplicateTitleError
+from .columns import PAGE_SIZE, ColumnPickerData, column_picker
+from .db import Database, DuplicateTitleError, WorkbookDraft
 from .logging_setup import audit
 from .messages import messages
-from .monitor import Monitor, cache_caption, format_grades, subject_pages
+from .monitor import GradeReport, Monitor, cache_caption, format_grades, subject_pages
 from .network import network_sessions
 from .presentation import bold, create_view, safe_lines, send_view, table_link, view_markup
 from .sheets import (
@@ -89,7 +91,8 @@ class Dialog(StatesGroup):
     remove = State()
 
 
-def registration_summary(reports):
+def registration_summary(reports: list[GradeReport]) -> str:
+    """Summarize missing, ambiguous, and unavailable grade reports."""
     if not reports:
         return "Таблиц пока нет"
     missing = [r["title"] for r in reports if r["status"] == "missing"]
@@ -108,7 +111,8 @@ def registration_summary(reports):
     return "\n".join(lines)
 
 
-def parse_spec(text):
+def parse_spec(text: str) -> tuple[str, str, int, tuple[int, ...]]:
+    """Parse a manually entered sheet specification."""
     pieces = [part.strip() for part in text.split("|")]
     if len(pieces) not in (2, 3, 4) or not pieces[0] or len(pieces[0]) > 200:
         raise SheetError("Формат: Предмет | ссылка | строка заголовков | столбцы ФИО")
@@ -123,7 +127,8 @@ def parse_spec(text):
     return pieces[0], url, header, columns
 
 
-def confirmation(action, token, label):
+def confirmation(action: str, token: str, label: str) -> InlineKeyboardMarkup:
+    """Build a confirmation keyboard with a scoped token."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -134,7 +139,8 @@ def confirmation(action, token, label):
     )
 
 
-def menu(admin=False):
+def menu(admin: bool = False) -> ReplyKeyboardMarkup:
+    """Build the role-specific reply keyboard."""
     rows = [["Мои оценки", "Таблицы"], ["Уведомления", "Помощь"], ["Предложить таблицу"]]
     if admin:
         rows.extend(
@@ -153,10 +159,13 @@ def menu(admin=False):
 
 
 class AccessMiddleware(BaseMiddleware):
-    def __init__(self, db, contact):
+    def __init__(self, db: Database, contact: str) -> None:
+        """Store the access repository and public contact name."""
         self.db, self.contact = db, contact.strip().lstrip("@")
 
-    async def __call__(self, handler, event, data):
+    async def __call__(self, handler: Callable[[Message | CallbackQuery, dict[str, Any]], Awaitable[object]],
+                       event: Message | CallbackQuery, data: dict[str, Any]) -> object:
+        """Reject unauthorized updates before dispatching their handlers."""
         user = event.from_user
         start = isinstance(event, Message) and bool(event.text) and event.text.split(maxsplit=1)[0] == "/start"
         pending = user and isinstance(event, Message) and bool(event.text) and (
@@ -184,14 +193,16 @@ class AccessMiddleware(BaseMiddleware):
             raise
 
 
-def create_router(db, monitor, contact_username=""):
+def create_router(db: Database, monitor: Monitor | None, contact_username: str = "") -> Router:
+    """Register Telegram handlers for access, grades, and administration."""
     router = Router()
     guard = AccessMiddleware(db, contact_username)
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
     menu_labels = {button.text for row in menu(True).keyboard for button in row}
 
-    def help_text(user_id):
+    def help_text(user_id: int) -> str:
+        """Render help with the current cache time and user role."""
         name = db.user_name(user_id)
         timestamp = db.latest_cache_timestamp()
         return help_message(
@@ -202,22 +213,25 @@ def create_router(db, monitor, contact_username=""):
             fetched_at=timestamp,
         )
 
-    def registered(user_id):
+    def registered(user_id: int) -> bool:
+        """Check whether a user has an active profile."""
         return db.user_name(user_id) is not None
 
     @router.message(F.chat.type != "private")
-    async def private_only(message: Message):
-        await message.answer("Напиши боту в личные сообщения")
+    async def private_only(message: Message) -> None:
+        """Handle the private only interaction."""
+        await message.answer(messages.render("replies.private_only_1"))
 
     @router.message(CommandStart())
-    async def start(message: Message, state: FSMContext):
+    async def start(message: Message, state: FSMContext) -> None:
+        """Handle the start interaction."""
         await state.clear()
         user_id = message.from_user.id
         if db.blocked(user_id):
             await message.answer(messages.render("access.blocked"))
             return
         if user_id == db.admin_id() and db.member_name(user_id) is None:
-            await message.answer("Панель администратора", reply_markup=menu(True))
+            await message.answer(messages.render("replies.start_1"), reply_markup=menu(True))
             return
         if not db.authorized(user_id):
             token = (message.text or "").partition(" ")[2].strip()
@@ -247,11 +261,13 @@ def create_router(db, monitor, contact_username=""):
         if lines:
             await send_view(message, db, lines)
 
-    async def has_join_draft(message: Message):
+    async def has_join_draft(message: Message) -> bool:
+        """Check whether a message belongs to an invitation signup."""
         return db.has_join_draft(message.from_user.id)
 
     @router.message(has_join_draft, F.text, ~F.text.startswith("/"))
-    async def join_name(message: Message, state: FSMContext):
+    async def join_name(message: Message, state: FSMContext) -> None:
+        """Handle the join name interaction."""
         name = " ".join(message.text.split())
         if not valid_name(name):
             await message.answer(messages.render("registration.invalid_name"))
@@ -275,33 +291,37 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Помощь")
     @router.message(Command("help"))
-    async def help_command(message: Message):
+    async def help_command(message: Message) -> None:
+        """Handle the help command interaction."""
         await message.answer(help_text(message.from_user.id), parse_mode="HTML")
 
     @router.message(Command("cancel"))
-    async def cancel(message: Message, state: FSMContext):
+    async def cancel(message: Message, state: FSMContext) -> None:
+        """Handle the cancel interaction."""
         await state.clear()
         db.discard_join_draft(message.from_user.id)
         reply_markup = menu(message.from_user.id == db.admin_id()) if db.authorized(message.from_user.id) else ReplyKeyboardRemove()
-        await message.answer("Отменил", reply_markup=reply_markup)
+        await message.answer(messages.render("replies.cancel_1"), reply_markup=reply_markup)
 
     @router.message(Command("name"))
-    async def name_command(message: Message, state: FSMContext):
+    async def name_command(message: Message, state: FSMContext) -> None:
+        """Handle the name command interaction."""
         if db.member_name(message.from_user.id) is None:
-            await message.answer("Эта команда доступна зарегистрированным пользователям")
+            await message.answer(messages.render("replies.name_command_1"))
             return
         await state.set_state(Dialog.requested_name)
-        await message.answer("Введи новое ФИО. Администратор должен одобрить смену")
+        await message.answer(messages.render("replies.name_command_2"))
 
     @router.message(Dialog.requested_name, F.text, ~F.text.startswith("/"))
-    async def requested_name(message: Message, state: FSMContext):
+    async def requested_name(message: Message, state: FSMContext) -> None:
+        """Handle the requested name interaction."""
         name = " ".join(message.text.split())
         if not valid_name(name):
             await message.answer(messages.render("registration.invalid_name"))
             return
         db.request_name(message.from_user.id, name)
         await state.clear()
-        await message.answer("Запрос отправлен администратору")
+        await message.answer(messages.render("replies.requested_name_1"))
         await message.bot.send_message(
             db.admin_id(),
             f"Пользователь {message.from_user.id} просит сменить ФИО на {name}",
@@ -312,15 +332,16 @@ def create_router(db, monitor, contact_username=""):
         )
 
     @router.callback_query(F.data.regexp(r"^name_(approve|reject):[0-9]+$"))
-    async def approve_name(callback: CallbackQuery):
+    async def approve_name(callback: CallbackQuery) -> None:
+        """Handle the approve name interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.approve_name_1"), show_alert=True)
             return
         action, raw_id = callback.data.split(":")
         user_id = int(raw_id)
         requested = db.name_request(user_id)
         if requested is None or not db.authorized(user_id):
-            await callback.answer("Запрос устарел", show_alert=True)
+            await callback.answer(messages.render("replies.approve_name_2"), show_alert=True)
             return
         if action == "name_approve":
             db.change_name(user_id, requested)
@@ -335,9 +356,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Уведомления")
     @router.message(Command("notifications"))
-    async def notifications(message: Message):
+    async def notifications(message: Message) -> None:
+        """Handle the notifications interaction."""
         if not registered(message.from_user.id):
-            await message.answer("Открой /start, чтобы начать получать свои оценки")
+            await message.answer(messages.render("replies.notifications_1"))
             return
         enabled = db.toggle_notifications(message.from_user.id)
         await message.answer(
@@ -347,9 +369,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Мои оценки")
     @router.message(Command("grades"))
-    async def grades(message: Message):
+    async def grades(message: Message) -> None:
+        """Handle the grades interaction."""
         if not registered(message.from_user.id):
-            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            await message.answer(messages.render("replies.grades_1"))
             return
         reports = await monitor.inspect_user(message.from_user.id)
         lines = [bold("Текущие оценки"), ""]
@@ -366,38 +389,41 @@ def create_router(db, monitor, contact_username=""):
         await send_view(message, db, lines if reports else ["Таблиц пока нет"])
 
     @router.message(Command("subject"))
-    async def subject_command(message: Message, state: FSMContext):
+    async def subject_command(message: Message, state: FSMContext) -> None:
+        """Handle the subject command interaction."""
         if not registered(message.from_user.id):
-            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            await message.answer(messages.render("replies.subject_command_1"))
             return
         await state.clear()
         if not db.sheets_by_status("approved"):
-            await message.answer("Таблиц пока нет")
+            await message.answer(messages.render("replies.subject_command_2"))
             return
         await state.set_state(Dialog.subject_id)
-        await message.answer("Отправь ID таблицы из /tables, чтобы посмотреть все свои оценки. /cancel — отменить")
+        await message.answer(messages.render("replies.subject_command_3"))
 
     @router.message(Dialog.subject_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
-    async def subject_id(message: Message, state: FSMContext):
+    async def subject_id(message: Message, state: FSMContext) -> None:
+        """Handle the subject id interaction."""
         if not registered(message.from_user.id):
             await state.clear()
-            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            await message.answer(messages.render("replies.subject_id_1"))
             return
         try:
             sheet_id = int(message.text.strip())
             if not 0 < sheet_id < 2**63:
                 raise ValueError
         except ValueError:
-            await message.answer("Нужен числовой ID таблицы из /tables")
+            await message.answer(messages.render("replies.subject_id_2"))
             return
         if await show_subject(message, message.from_user.id, sheet_id):
             await state.clear()
 
-    async def show_subject(message, user_id, sheet_id):
+    async def show_subject(message: Message, user_id: int, sheet_id: int) -> bool:
+        """Send one user-owned subject view when the sheet exists."""
         reports = await monitor.inspect_user(user_id)
         report = next((r for r in reports if r["sheet_id"] == sheet_id), None)
         if report is None:
-            await message.answer("Таблица больше недоступна. Отправь ID из /tables")
+            await message.answer(messages.render("replies.show_subject_1"))
             return False
         view_id, pages = create_view(db, user_id, [], pages=subject_pages(report))
         await message.answer(pages[0], parse_mode="HTML", reply_markup=view_markup(db, view_id),
@@ -405,14 +431,15 @@ def create_router(db, monitor, contact_username=""):
         return True
 
     @router.callback_query(F.data.regexp(r"^subject:\d+$"))
-    async def subject(callback: CallbackQuery):
+    async def subject(callback: CallbackQuery) -> None:
+        """Handle the subject interaction."""
         if not registered(callback.from_user.id):
-            await callback.answer("Открой /start", show_alert=True)
+            await callback.answer(messages.render("replies.subject_1"), show_alert=True)
             return
         reports = await monitor.inspect_user(callback.from_user.id)
         report = next((r for r in reports if r["sheet_id"] == int(callback.data.split(":")[1])), None)
         if report is None:
-            await callback.answer("Таблица больше недоступна", show_alert=True)
+            await callback.answer(messages.render("replies.subject_2"), show_alert=True)
             return
         await callback.answer()
         if isinstance(callback.message, Message):
@@ -424,7 +451,8 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Таблицы")
     @router.message(Command("tables"))
-    async def tables(message: Message):
+    async def tables(message: Message) -> None:
+        """Handle the tables interaction."""
         rows = db.approved_sheets_with_cache_time()
         lines = [bold("Таблицы группы"), ""]
         now = time.time()
@@ -450,49 +478,53 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Столбцы")
     @router.message(Command("columns"))
-    async def columns_command(message: Message, state: FSMContext):
+    async def columns_command(message: Message, state: FSMContext) -> None:
+        """Handle the columns command interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.columns_command_1"))
             return
         await state.clear()
         if not db.sheets_by_status("approved"):
-            await message.answer("Таблиц пока нет")
+            await message.answer(messages.render("replies.columns_command_2"))
             return
         await state.set_state(Dialog.columns_id)
-        await message.answer("Отправь ID таблицы из /tables для настройки столбцов. /cancel — отменить")
+        await message.answer(messages.render("replies.columns_command_3"))
 
     @router.message(Dialog.columns_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
-    async def columns_id(message: Message, state: FSMContext):
+    async def columns_id(message: Message, state: FSMContext) -> None:
+        """Handle the columns id interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.columns_id_1"))
             return
         try:
             sheet_id = int(message.text.strip())
             if not 0 < sheet_id < 2**63:
                 raise ValueError
         except ValueError:
-            await message.answer("Нужен числовой ID таблицы из /tables")
+            await message.answer(messages.render("replies.columns_id_2"))
             return
         await open_saved_columns(message, state, sheet_id)
 
     @router.callback_query(F.data.regexp(r"^pick_columns:\d+$"))
-    async def edit_columns(callback: CallbackQuery, state: FSMContext):
+    async def edit_columns(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the edit columns interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.edit_columns_1"), show_alert=True)
             return
         await callback.answer()
         if isinstance(callback.message, Message):
             await open_saved_columns(callback.message, state, int(callback.data.split(":")[1]))
 
-    async def open_saved_columns(message, state, sheet_id):
+    async def open_saved_columns(message: Message, state: FSMContext, sheet_id: int) -> None:
+        """Load cached column choices for an approved sheet."""
         sheet = db.sheet(sheet_id, "approved")
         if sheet is None:
-            await message.answer("Таблица больше недоступна")
+            await message.answer(messages.render("replies.open_saved_columns_1"))
             return
         cached = db.cached_rows(sheet_id)
         if cached is None:
-            await message.answer("Кэш ещё не загружен. Сначала нажми «Обновить»")
+            await message.answer(messages.render("replies.open_saved_columns_2"))
             return
         options = json.loads(sheet["parser_options"])
         raw_rows = json.loads(cached)
@@ -510,23 +542,26 @@ def create_router(db, monitor, contact_username=""):
                                                                 options.get("header_start")))
         await open_column_picker(message, state, all_columns.labels, parsed.labels, sheet["title"])
 
-    async def open_column_picker(message, state, labels, selected, title):
+    async def open_column_picker(message: Message, state: FSMContext, labels: dict[int, str],
+                                 selected: dict[int, str], title: str) -> None:
+        """Show selectable grade columns."""
         await state.update_data(column_labels=labels, column_selected=list(selected), column_page=0,
                                 column_title=title, column_token=secrets.token_hex(8))
-        text, markup = column_picker(await state.get_data())
+        text, markup = column_picker(cast(ColumnPickerData, await state.get_data()))
         await message.answer(text, parse_mode="HTML", reply_markup=markup)
 
     @router.callback_query(F.data.regexp(r"^colpick:[a-f0-9]{16}:(\d+|page\d+|all|done|cancel)$"))
-    async def select_column(callback: CallbackQuery, state: FSMContext):
+    async def select_column(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the select column interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.select_column_1"), show_alert=True)
             return
         _, token, action = callback.data.split(":")
         data = await state.get_data()
         if (token != data.get("column_token") or await state.get_state() not in {
             Dialog.sheet_columns.state, Dialog.edit_columns.state,
         }):
-            await callback.answer("Настройка устарела")
+            await callback.answer(messages.render("replies.select_column_2"))
             return
         if not isinstance(callback.message, Message):
             await callback.answer()
@@ -562,21 +597,21 @@ def create_router(db, monitor, contact_username=""):
         elif action.startswith("page"):
             page = int(action[4:])
             if page * PAGE_SIZE >= len(labels):
-                await callback.answer("Страница не найдена")
+                await callback.answer(messages.render("replies.select_column_3"))
                 return
             await state.update_data(column_page=page)
         else:
             index = int(action)
             if index not in labels:
-                await callback.answer("Столбец не найден")
+                await callback.answer(messages.render("replies.select_column_4"))
                 return
             selected.symmetric_difference_update({index})
             if not selected:
-                await callback.answer("Оставь хотя бы один столбец оценок", show_alert=True)
+                await callback.answer(messages.render("replies.select_column_5"), show_alert=True)
                 return
         await state.update_data(column_selected=sorted(selected))
         await callback.answer()
-        text, markup = column_picker(await state.get_data())
+        text, markup = column_picker(cast(ColumnPickerData, await state.get_data()))
         try:
             await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
         except TelegramBadRequest as exc:
@@ -585,25 +620,27 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text.in_({"Добавить таблицу", "Предложить таблицу"}))
     @router.message(Command("add", "suggest"))
-    async def add(message: Message, state: FSMContext):
+    async def add(message: Message, state: FSMContext) -> None:
+        """Handle the add interaction."""
         user_id = message.from_user.id
         direct = message.text == "Добавить таблицу" or message.text.split()[0].split("@")[0] == "/add"
         if direct and user_id != db.admin_id():
-            await message.answer("Эта команда недоступна")
+            await message.answer(messages.render("replies.add_1"))
             return
         if not registered(user_id) and user_id != db.admin_id():
-            await message.answer("Открой /start, чтобы начать пользоваться ботом")
+            await message.answer(messages.render("replies.add_2"))
             return
         await state.clear()
         await state.update_data(direct=direct, header=1, columns=(1,))
         await state.set_state(Dialog.title)
-        await message.answer("Отправь название предмета")
+        await message.answer(messages.render("replies.add_3"))
 
     @router.message(Command("layout"))
-    async def layout(message: Message, state: FSMContext):
+    async def layout(message: Message, state: FSMContext) -> None:
         # Optional advanced configuration; the normal flow only asks for title and link.
+        """Handle the layout interaction."""
         if await state.get_state() != Dialog.link.state:
-            await message.answer("Сначала начни добавление таблицы")
+            await message.answer(messages.render("replies.layout_1"))
             return
         try:
             _, _, header, columns = parse_spec(
@@ -611,22 +648,23 @@ def create_router(db, monitor, contact_username=""):
                 + message.text.partition(" ")[2]
             )
         except SheetError:
-            await message.answer("Укажи строку заголовков и столбцы ФИО: /layout 2 | 1,2,3")
+            await message.answer(messages.render("replies.layout_2"))
             return
         await state.update_data(header=header, columns=columns)
-        await message.answer("Настройки сохранил — отправь ссылку. На шаге настройки листа отправь «по умолчанию»")
+        await message.answer(messages.render("replies.layout_3"))
 
     @router.message(F.text == "Обновить")
     @router.message(Command("refresh"))
-    async def refresh(message: Message):
+    async def refresh(message: Message) -> None:
+        """Handle the refresh interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.refresh_1"))
             return
-        await message.answer("Секундочку")
+        await message.answer(messages.render("replies.refresh_2"))
         try:
             result = await monitor.scan()
         except Exception:
-            await message.answer("Не удалось обновить кэш")
+            await message.answer(messages.render("replies.refresh_3"))
             return
         lines = [bold("Обновление кэша завершено"), f"Обновлено таблиц: {result['updated']}"]
         if result["failed"]:
@@ -643,9 +681,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Предложения")
     @router.message(Command("pending"))
-    async def pending(message: Message):
+    async def pending(message: Message) -> None:
+        """Handle the pending interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.pending_1"))
             return
         rows = db.sheets_by_status("pending")
         lines, actions = [bold("Предложения таблиц"), ""], {}
@@ -665,19 +704,20 @@ def create_router(db, monitor, contact_username=""):
         await send_view(message, db, lines if rows else ["Нет предложений"], admin=True, actions=actions)
 
     @router.callback_query(F.data.regexp(r"^page:[a-f0-9]{16}:\d+$"))
-    async def page(callback: CallbackQuery):
+    async def page(callback: CallbackQuery) -> None:
+        """Handle the page interaction."""
         _, view_id, index = callback.data.split(":")
-        rows = ([row] if (row := db.view(view_id)) else [])
+        view = db.view(view_id)
         if (
-            not rows
-            or rows[0]["owner"] != callback.from_user.id
-            or (rows[0]["admin"] and callback.from_user.id != db.admin_id())
+            view is None
+            or view["owner"] != callback.from_user.id
+            or (view["admin"] and callback.from_user.id != db.admin_id())
         ):
-            await callback.answer("Этот список недоступен", show_alert=True)
+            await callback.answer(messages.render("replies.page_1"), show_alert=True)
             return
-        pages, index = json.loads(rows[0]["pages"]), int(index)
+        pages, index = json.loads(view["pages"]), int(index)
         if index >= len(pages):
-            await callback.answer("Страница не найдена")
+            await callback.answer(messages.render("replies.page_2"))
             return
         await callback.answer()
         if isinstance(callback.message, Message) and callback.message.text != pages[index]:
@@ -693,40 +733,41 @@ def create_router(db, monitor, contact_username=""):
                     raise
 
     @router.callback_query(F.data.regexp(r"^(approve|reject):\d+$"))
-    async def moderate(callback: CallbackQuery, state: FSMContext):
+    async def moderate(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the moderate interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.moderate_1"), show_alert=True)
             return
         action, sheet_id = callback.data.split(":")
-        row = ([row] if (row := db.sheet(int(sheet_id), "pending")) else [])
-        if not row:
-            await callback.answer("Уже обработано")
+        sheet = db.sheet(int(sheet_id), "pending")
+        if sheet is None:
+            await callback.answer(messages.render("replies.moderate_2"))
             return
-        if action == "approve" and "tabs" in json.loads(row[0]["parser_options"]):
+        if action == "approve" and "tabs" in json.loads(sheet["parser_options"]):
             await configure_proposal(callback, state)
             return
         parsed = None
         if action == "approve":
-            await callback.answer("Секундочку")
+            await callback.answer(messages.render("replies.moderate_3"))
             if isinstance(callback.message, Message):
-                await callback.message.answer("Секундочку")
+                await callback.message.answer(messages.render("replies.moderate_4"))
             try:
-                parsed = await monitor.fetch(row[0])
+                parsed = await monitor.fetch(sheet)
             except Exception as exc:
                 audit("moderation_failed", level=logging.WARNING, sheet_id=int(sheet_id), error=exc)
                 if isinstance(callback.message, Message):
-                    await callback.message.answer("Таблица недоступна или формат неверен")
+                    await callback.message.answer(messages.render("replies.moderate_5"))
                 return
         async with monitor.lock:
             if callback.from_user.id != db.admin_id():
                 if isinstance(callback.message, Message):
-                    await callback.message.answer("Эта команда больше недоступна")
+                    await callback.message.answer(messages.render("replies.moderate_6"))
                 return
             if not db.moderate_sheet(int(sheet_id), action == "approve", parsed):
                 if action == "approve" and isinstance(callback.message, Message):
-                    await callback.message.answer("Уже обработано")
+                    await callback.message.answer(messages.render("replies.moderate_7"))
                 elif action != "approve":
-                    await callback.answer("Уже обработано")
+                    await callback.answer(messages.render("replies.moderate_8"))
                 return
         audit(
             "moderation_finished",
@@ -735,9 +776,9 @@ def create_router(db, monitor, contact_username=""):
         )
         if action == "approve":
             if isinstance(callback.message, Message):
-                await callback.message.answer("Таблица одобрена")
+                await callback.message.answer(messages.render("replies.moderate_9"))
         else:
-            await callback.answer("Отклонено")
+            await callback.answer(messages.render("replies.moderate_10"))
         if isinstance(callback.message, Message) and callback.message.reply_markup:
             remaining = [
                 [
@@ -756,9 +797,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Удалить таблицу")
     @router.message(Command("remove"))
-    async def remove(message: Message, state: FSMContext):
+    async def remove(message: Message, state: FSMContext) -> None:
+        """Handle the remove interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Эта команда недоступна")
+            await message.answer(messages.render("replies.remove_1"))
             return
         await state.clear()
         await state.set_state(Dialog.remove)
@@ -774,9 +816,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Пользователи")
     @router.message(Command("members"))
-    async def members(message: Message):
+    async def members(message: Message) -> None:
+        """Handle the members interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.members_1"))
             return
         rows = db.member_rows()
         lines = [bold("Пользователи группы"), ""]
@@ -795,9 +838,10 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(F.text == "Создать ссылку")
     @router.message(Command("invite"))
-    async def invite(message: Message):
+    async def invite(message: Message) -> None:
+        """Handle the invite interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.invite_1"))
             return
         argument = (message.text or "").partition(" ")[2].strip()
         try:
@@ -805,7 +849,7 @@ def create_router(db, monitor, contact_username=""):
             if not 1 <= hours <= 720:
                 raise ValueError
         except ValueError:
-            await message.answer("Укажи срок от 1 до 720 часов: /invite 24")
+            await message.answer(messages.render("replies.invite_2"))
             return
         username = (await message.bot.get_me()).username
         token = db.create_invitation(hours * 3600)
@@ -815,37 +859,40 @@ def create_router(db, monitor, contact_username=""):
         )
 
     @router.message(Command("rename"))
-    async def rename_member(message: Message):
+    async def rename_member(message: Message) -> None:
+        """Handle the rename member interaction."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.rename_member_1"))
             return
         parts = (message.text or "").split(maxsplit=2)
         if len(parts) != 3 or not parts[1].isdigit() or not valid_name(" ".join(parts[2].split())):
-            await message.answer("Формат: /rename ID Фамилия Имя")
+            await message.answer(messages.render("replies.rename_member_2"))
             return
         user_id, name = int(parts[1]), " ".join(parts[2].split())
         if not db.change_name(user_id, name):
-            await message.answer("Пользователь не найден")
+            await message.answer(messages.render("replies.rename_member_3"))
             return
-        await message.answer("ФИО изменено")
+        await message.answer(messages.render("replies.rename_member_4"))
         await message.bot.send_message(user_id, f"Администратор изменил ФИО на {name}")
 
     @router.message(F.text == "Заблокировать")
     @router.message(Command("revoke"))
-    async def revoke(message: Message, state: FSMContext):
+    async def revoke(message: Message, state: FSMContext) -> None:
+        """Remove a member, their active state, and queued messages."""
         if message.from_user.id != db.admin_id():
-            await message.answer("Команда доступна админу")
+            await message.answer(messages.render("replies.revoke_1"))
             return
         await state.clear()
         await state.set_state(Dialog.revoke)
         if not db.has_other_members():
             await state.clear()
-            await message.answer("Нет пользователей для закрытия доступа")
+            await message.answer(messages.render("replies.revoke_2"))
             return
-        await message.answer("Отправь ID пользователя из /members, чтобы закрыть доступ. /cancel — отменить")
+        await message.answer(messages.render("replies.revoke_3"))
 
     @router.message(Dialog.revoke, F.text, ~F.text.startswith("/"))
-    async def revoke_id(message: Message, state: FSMContext):
+    async def revoke_id(message: Message, state: FSMContext) -> None:
+        """Handle the revoke id interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
             return
@@ -854,27 +901,29 @@ def create_router(db, monitor, contact_username=""):
             if not 0 < user_id < 2**63:
                 raise ValueError
         except ValueError:
-            await message.answer("Нужен числовой ID из /members")
+            await message.answer(messages.render("replies.revoke_id_1"))
             return
         await ask_revoke(message, state, user_id)
 
-    async def ask_revoke(message, state, user_id):
-        rows = ([{"name": name}] if (name := db.member_name(user_id)) else [])
-        if not rows or user_id == db.admin_id():
-            await message.answer("Пользователь не найден или это текущий администратор")
+    async def ask_revoke(message: Message, state: FSMContext, user_id: int) -> None:
+        """Ask the administrator to confirm a member block."""
+        name = db.member_name(user_id)
+        if name is None or user_id == db.admin_id():
+            await message.answer(messages.render("replies.ask_revoke_1"))
             return
         token = secrets.token_hex(8)
         await state.update_data(member_id=user_id, token=token)
         await state.set_state(Dialog.revoke_confirm)
         await message.answer(
-            f"Заблокировать {rows[0]['name']}?",
+            f"Заблокировать {name}?",
             reply_markup=confirmation("revoke", token, "Заблокировать"),
         )
 
     @router.callback_query(F.data.regexp(r"^(remove|revoke|dismiss):[a-f0-9]{16}$"))
-    async def confirm(callback: CallbackQuery, state: FSMContext):
+    async def confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the confirm interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.confirm_1"), show_alert=True)
             return
         action, token = callback.data.split(":")
         data = await state.get_data()
@@ -884,7 +933,7 @@ def create_router(db, monitor, contact_username=""):
         }
         current = await state.get_state()
         if data.get("token") != token or (action != "dismiss" and states[action] != current):
-            await callback.answer("Подтверждение устарело", show_alert=True)
+            await callback.answer(messages.render("replies.confirm_2"), show_alert=True)
             return
         if action == "dismiss":
             result = "Отменил"
@@ -896,7 +945,7 @@ def create_router(db, monitor, contact_username=""):
                     audit("sheet_removed", sheet_id=data["sheet_id"], count=deleted)
                 else:
                     if data["member_id"] == db.admin_id():
-                        await callback.answer("Нельзя закрыть доступ текущему админу", show_alert=True)
+                        await callback.answer(messages.render("replies.confirm_3"), show_alert=True)
                         return
                     db.block(data["member_id"])
                     result = "Пользователь заблокирован"
@@ -906,12 +955,15 @@ def create_router(db, monitor, contact_username=""):
             await callback.message.edit_reply_markup(reply_markup=None)
             await callback.message.answer(result, reply_markup=menu(True))
 
-    async def setup_view(message, lines):
+    async def setup_view(message: Message, lines: Sequence[str]) -> None:
+        """Send a paginated administrator setup view."""
         view_id, pages = create_view(db, db.admin_id(), safe_lines("\n".join(lines)), admin=True)
         await message.answer(pages[0], parse_mode="HTML", reply_markup=view_markup(db, view_id),
                              link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-    def proposal_picker(identifier, data, page=0):
+    def proposal_picker(identifier: int, data: dict[str, Any],
+                        page: int = 0) -> InlineKeyboardMarkup:
+        """Build the keyboard for selecting proposal tabs."""
         tabs, selected = data["tabs"], set(data["selected"])
         rows = [[InlineKeyboardButton(text=("✓ " if i in selected else "○ ") + tab["name"][:50],
                                       callback_data=f"ptabs:{identifier}:{i}")]
@@ -929,32 +981,33 @@ def create_router(db, monitor, contact_username=""):
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     @router.callback_query(F.data.regexp(r"^(ptabs|ppage):\d+:(\d+|all)$"))
-    async def proposal_select(callback: CallbackQuery):
+    async def proposal_select(callback: CallbackQuery) -> None:
+        """Handle the proposal select interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.proposal_select_1"), show_alert=True)
             return
         action, identifier, value = callback.data.split(":")
-        rows = ([{"parser_options": options}] if (options := db.parser_options(int(identifier), "pending")) else [])
-        if not rows:
-            await callback.answer("Уже обработано")
+        options = db.parser_options(int(identifier), "pending")
+        if options is None:
+            await callback.answer(messages.render("replies.proposal_select_2"))
             return
-        data = json.loads(rows[0]["parser_options"])
+        data = json.loads(options)
         if "tabs" not in data:
-            await callback.answer("Выбор устарел")
+            await callback.answer(messages.render("replies.proposal_select_3"))
             return
         selected = set(data["selected"])
         page = data.get("page", 0)
         if action == "ppage":
             page = int(value)
             if not 0 <= page < (len(data["tabs"]) + 14) // 15:
-                await callback.answer("Страница не найдена")
+                await callback.answer(messages.render("replies.proposal_select_4"))
                 return
         elif value == "all":
             selected = set() if len(selected) == len(data["tabs"]) else set(range(len(data["tabs"])))
         else:
             index = int(value)
             if index >= len(data["tabs"]):
-                await callback.answer("Лист не найден")
+                await callback.answer(messages.render("replies.proposal_select_5"))
                 return
             selected.symmetric_difference_update({index})
         data.update(selected=sorted(selected), page=page)
@@ -963,7 +1016,8 @@ def create_router(db, monitor, contact_username=""):
         if isinstance(callback.message, Message):
             await callback.message.edit_reply_markup(reply_markup=proposal_picker(identifier, data, page))
 
-    def sheet_picker(data, page=0):
+    def sheet_picker(data: dict[str, Any], page: int = 0) -> InlineKeyboardMarkup:
+        """Build the keyboard for selecting workbook tabs."""
         tabs, selected, token = data["tabs"], set(data["selected"]), data["setup_token"]
         rows = [[InlineKeyboardButton(
             text=("✓ " if i in selected else "○ ") + tab["name"][:50],
@@ -980,15 +1034,17 @@ def create_router(db, monitor, contact_username=""):
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    async def begin_workbook(message, state, url):
+    async def begin_workbook(message: Message, state: FSMContext, url: str) -> None:
+        """Start guided workbook setup from a sheet URL."""
         tabs = await discover_sheets(monitor.session, url)
         await state.update_data(tabs=tabs, selected=list(range(len(tabs))), setup_token=secrets.token_hex(8),
                                 tab_page=0, configured=[])
         await state.set_state(Dialog.sheet_selection)
-        await message.answer("Выбери листы для парсинга (по умолчанию выбраны все)",
+        await message.answer(messages.render("replies.begin_workbook_1"),
                              reply_markup=sheet_picker(await state.get_data()))
 
-    async def configure_next(message, state):
+    async def configure_next(message: Message, state: FSMContext) -> None:
+        """Advance to the next selected workbook tab."""
         data = await state.get_data()
         remaining = [i for i in data["selected"] if i not in [c["index"] for c in data["configured"]]]
         if not remaining:
@@ -997,7 +1053,7 @@ def create_router(db, monitor, contact_username=""):
             for item in data["configured"]:
                 lines.append(f"{item['title']}: {len(item['grade_columns'])} столбцов оценок")
             await setup_view(message, lines)
-            await message.answer("Сохранить все листы?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            await message.answer(messages.render("replies.configure_next_1"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text="Сохранить", callback_data=f"worksave:{data['setup_token']}")
             ]]))
             return
@@ -1024,25 +1080,26 @@ def create_router(db, monitor, contact_username=""):
             await request_layout(message, state)
 
     @router.callback_query(F.data.regexp(r"^(tabs|tabpage):[a-f0-9]{16}:(\d+|all|next)$"))
-    async def select_tabs(callback: CallbackQuery, state: FSMContext):
+    async def select_tabs(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the select tabs interaction."""
         data = await state.get_data()
         action, token, value = callback.data.split(":")
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.select_tabs_1"), show_alert=True)
             return
         if await state.get_state() != Dialog.sheet_selection.state or token != data.get("setup_token"):
-            await callback.answer("Выбор устарел")
+            await callback.answer(messages.render("replies.select_tabs_2"))
             return
         selected = set(data["selected"])
         if action == "tabpage":
             page = int(value)
             if not 0 <= page < (len(data["tabs"]) + 14) // 15:
-                await callback.answer("Страница не найдена")
+                await callback.answer(messages.render("replies.select_tabs_3"))
                 return
             await state.update_data(tab_page=page)
         elif value == "next":
             if not selected:
-                await callback.answer("Выбери хотя бы один лист", show_alert=True)
+                await callback.answer(messages.render("replies.select_tabs_4"), show_alert=True)
                 return
             await callback.answer()
             if isinstance(callback.message, Message):
@@ -1054,7 +1111,7 @@ def create_router(db, monitor, contact_username=""):
         else:
             index = int(value)
             if index >= len(data["tabs"]):
-                await callback.answer("Лист не найден")
+                await callback.answer(messages.render("replies.select_tabs_5"))
                 return
             selected.symmetric_difference_update({index})
         await state.update_data(selected=sorted(selected))
@@ -1063,17 +1120,19 @@ def create_router(db, monitor, contact_username=""):
             data = await state.get_data()
             await callback.message.edit_reply_markup(reply_markup=sheet_picker(data, data["tab_page"]))
 
-    async def skip_current(message, state):
+    async def skip_current(message: Message, state: FSMContext) -> None:
+        """Skip the current workbook tab."""
         data = await state.get_data()
         await state.update_data(selected=[i for i in data["selected"] if i != data["current_index"]])
         if not (await state.get_data())["selected"]:
             await state.clear()
-            await message.answer("Все листы пропущены. Ничего не сохранено")
+            await message.answer(messages.render("replies.skip_current_1"))
             return
         await configure_next(message, state)
 
     @router.message(Dialog.sheet_retry, F.text, ~F.text.startswith("/"))
-    async def retry_sheet(message: Message, state: FSMContext):
+    async def retry_sheet(message: Message, state: FSMContext) -> None:
+        """Handle the retry sheet interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
             return
@@ -1082,7 +1141,8 @@ def create_router(db, monitor, contact_username=""):
         else:
             await configure_next(message, state)
 
-    def setup_keyboard(data):
+    def setup_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
+        """Build the keyboard for parser setup."""
         prefix = f"sheetcfg:{data['setup_token']}:{data['current_index']}"
         return InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Далее →", callback_data=prefix + ":next")],
@@ -1093,7 +1153,8 @@ def create_router(db, monitor, contact_username=""):
             [InlineKeyboardButton(text="Пропустить лист", callback_data=prefix + ":skip")],
         ])
 
-    async def request_layout(message, state):
+    async def request_layout(message: Message, state: FSMContext) -> None:
+        """Ask for header and name column layout."""
         data = await state.get_data()
         await state.set_state(Dialog.sheet_layout)
         # A compact header-only sample is enough for manual correction.
@@ -1104,15 +1165,16 @@ def create_router(db, monitor, contact_username=""):
         await message.answer("\n".join(lines))
 
     @router.callback_query(F.data.regexp(r"^sheetcfg:[a-f0-9]{16}:\d+:(next|totals|all|details|layout|skip)$"))
-    async def sheet_setup_action(callback: CallbackQuery, state: FSMContext):
+    async def sheet_setup_action(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the sheet setup action interaction."""
         data = await state.get_data()
         _, token, index, action = callback.data.split(":")
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.sheet_setup_action_1"), show_alert=True)
             return
         if (token != data.get("setup_token") or int(index) != data.get("current_index")
                 or await state.get_state() != Dialog.sheet_columns.state):
-            await callback.answer("Настройка устарела")
+            await callback.answer(messages.render("replies.sheet_setup_action_2"))
             return
         await callback.answer()
         if not isinstance(callback.message, Message):
@@ -1133,12 +1195,13 @@ def create_router(db, monitor, contact_username=""):
                         if label.strip().casefold() not in {"№", "номер", "п/п", "№ п/п"}
                         and (action == "all" or "итог" in label.casefold())]
             if not selected:
-                await callback.message.answer("Итоговых столбцов не найдено. Выбери их текстом или открой список столбцов")
+                await callback.message.answer(messages.render("replies.sheet_setup_action_3"))
                 return
             await state.update_data(grade_columns=selected)
             await show_columns(callback.message, state)
 
-    async def accept_current(message, state):
+    async def accept_current(message: Message, state: FSMContext) -> None:
+        """Validate and store the current tab configuration."""
         data = await state.get_data()
         tab = data["tabs"][data["current_index"]]
         title = data["title"] if len(data["tabs"]) == 1 else f"{data['title']} · {tab['name']}"
@@ -1151,7 +1214,8 @@ def create_router(db, monitor, contact_username=""):
         await state.update_data(configured=configured)
         await configure_next(message, state)
 
-    async def show_columns(message, state, *, detailed=False):
+    async def show_columns(message: Message, state: FSMContext, *, detailed: bool = False) -> bool:
+        """Display grade columns for the current tab."""
         data = await state.get_data()
         try:
             parsed = Sheet(data["raw_rows"], data["header"], tuple(data["columns"]),
@@ -1188,7 +1252,8 @@ def create_router(db, monitor, contact_username=""):
 
     @router.message(Dialog.sheet_columns, F.text.contains("|"), ~F.text.startswith("/"))
     @router.message(Dialog.sheet_layout, F.text, ~F.text.startswith("/"))
-    async def workbook_layout(message: Message, state: FSMContext):
+    async def workbook_layout(message: Message, state: FSMContext) -> None:
+        """Handle the workbook layout interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
             return
@@ -1214,12 +1279,13 @@ def create_router(db, monitor, contact_username=""):
             if not await show_columns(message, state):
                 return
         except (ValueError, SheetError):
-            await message.answer("Неверный формат. Пример: 1-3 | B. Номера строк начинаются с 1")
+            await message.answer(messages.render("replies.workbook_layout_1"))
             return
         await state.set_state(Dialog.sheet_columns)
 
     @router.message(Dialog.sheet_columns, F.text, ~F.text.startswith("/"))
-    async def workbook_columns(message: Message, state: FSMContext):
+    async def workbook_columns(message: Message, state: FSMContext) -> None:
+        """Handle the workbook columns interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
             return
@@ -1227,7 +1293,7 @@ def create_router(db, monitor, contact_username=""):
         text = message.text.strip().casefold()
         if text == "назад":
             await state.set_state(Dialog.sheet_layout)
-            await message.answer("Укажи строки заголовков и ФИО: 1-3 | B")
+            await message.answer(messages.render("replies.workbook_columns_1"))
             return
         if text == "пропустить":
             await skip_current(message, state)
@@ -1271,43 +1337,44 @@ def create_router(db, monitor, contact_username=""):
             await message.answer(str(exc))
 
     @router.callback_query(F.data.regexp(r"^worksave:[a-f0-9]{16}$"))
-    async def save_workbook(callback: CallbackQuery, state: FSMContext):
+    async def save_workbook(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the save workbook interaction."""
         data = await state.get_data()
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.save_workbook_1"), show_alert=True)
             return
         if (await state.get_state() != Dialog.workbook_confirm.state
                 or callback.data.split(":")[1] != data.get("setup_token")):
-            await callback.answer("Подтверждение устарело")
+            await callback.answer(messages.render("replies.save_workbook_2"))
             return
         try:
             async with monitor.lock:
-                db.save_workbook(data, callback.from_user.id)
+                db.save_workbook(cast(WorkbookDraft, data), callback.from_user.id)
         except (DuplicateTitleError, sqlite3.IntegrityError, SheetError) as exc:
-            await callback.answer("Не удалось сохранить", show_alert=True)
+            await callback.answer(messages.render("replies.save_workbook_3"), show_alert=True)
             if isinstance(callback.message, Message):
                 await callback.message.answer(f"Название или ссылка уже добавлены, либо предложение обработано: {exc}\n"
                                                "Ничего не сохранено. /cancel — отменить и начать заново")
             return
         await state.clear()
-        await callback.answer("Сохранено")
+        await callback.answer(messages.render("replies.save_workbook_4"))
         if isinstance(callback.message, Message):
             await callback.message.edit_reply_markup(reply_markup=None)
             await callback.message.answer(f"Добавлено листов: {len(data['configured'])}", reply_markup=menu(True))
         await monitor.deliver()
 
     @router.callback_query(F.data.regexp(r"^configure:\d+$"))
-    async def configure_proposal(callback: CallbackQuery, state: FSMContext):
+    async def configure_proposal(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the configure proposal interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.configure_proposal_1"), show_alert=True)
             return
-        rows = ([row] if (row := db.sheet(int(callback.data.split(":")[1]), "pending")) else [])
-        if not rows:
-            await callback.answer("Уже обработано")
+        row = db.sheet(int(callback.data.split(":")[1]), "pending")
+        if row is None:
+            await callback.answer(messages.render("replies.configure_proposal_2"))
             return
         await callback.answer()
         if isinstance(callback.message, Message):
-            row = rows[0]
             await state.clear()
             await state.update_data(title=row["title"], url=row["url"], direct=True,
                                     proposal_id=row["id"], proposer=row["proposer"])
@@ -1315,7 +1382,7 @@ def create_router(db, monitor, contact_username=""):
                 selection = json.loads(row["parser_options"])
                 if "tabs" in selection:
                     if not selection["selected"]:
-                        await callback.message.answer("Выбери хотя бы один лист в сообщении предложения")
+                        await callback.message.answer(messages.render("replies.configure_proposal_3"))
                         return
                     await state.update_data(tabs=selection["tabs"], selected=selection["selected"],
                                             configured=[], setup_token=secrets.token_hex(8), tab_page=0)
@@ -1326,31 +1393,33 @@ def create_router(db, monitor, contact_username=""):
                 await callback.message.answer(f"Не удалось найти листы: {exc}. Нажми «Настроить» ещё раз")
 
     @router.message(Dialog.title, F.text, ~F.text.startswith("/"))
-    async def save_title(message: Message, state: FSMContext):
+    async def save_title(message: Message, state: FSMContext) -> None:
+        """Handle the save title interaction."""
         title = message.text.strip()
         if not title or len(title) > 200 or "\n" in title:
-            await message.answer("Название должно быть от 1 до 200 символов")
+            await message.answer(messages.render("replies.save_title_1"))
             return
         if db.title_exists(title):
             await message.answer(
-                "Таблица с таким названием уже есть или ждёт проверки\nВведи другое название таблицы"
+                messages.render("replies.save_title_2")
             )
             return
         await state.update_data(title=title)
         await state.set_state(Dialog.link)
-        await message.answer("Отправь ссылку на таблицу")
+        await message.answer(messages.render("replies.save_title_3"))
 
     @router.message(Dialog.link, F.text, ~F.text.startswith("/"))
-    async def save_link(message: Message, state: FSMContext):
+    async def save_link(message: Message, state: FSMContext) -> None:
+        """Handle the save link interaction."""
         data = await state.get_data()
         direct = data["direct"]
         if direct and message.from_user.id != db.admin_id():
             await state.clear()
-            await message.answer("Эта команда больше недоступна")
+            await message.answer(messages.render("replies.save_link_1"))
             return
         try:
             url = sheet_url(message.text.strip())
-            await message.answer("Секундочку")
+            await message.answer(messages.render("replies.save_link_2"))
             if direct:
                 if db.title_exists(data["title"]):
                     raise DuplicateTitleError(data["title"])
@@ -1360,7 +1429,7 @@ def create_router(db, monitor, contact_username=""):
             parsed = None
             if not db.authorized(message.from_user.id) or (direct and message.from_user.id != db.admin_id()):
                 await state.clear()
-                await message.answer("Доступ изменился")
+                await message.answer(messages.render("replies.save_link_3"))
                 return
             proposal_id = db.add_sheet(
                 data["title"],
@@ -1384,48 +1453,51 @@ def create_router(db, monitor, contact_username=""):
             return
         except DuplicateTitleError:
             await state.set_state(Dialog.title)
-            await message.answer("Таблица с таким названием уже появилась\nВведи другое название таблицы")
+            await message.answer(messages.render("replies.save_link_4"))
             return
         except sqlite3.IntegrityError:
-            await message.answer("Таблица уже добавлена или ждёт проверки")
+            await message.answer(messages.render("replies.save_link_5"))
             return
         await state.clear()
         if direct:
-            await message.answer("Таблицу добавил")
+            await message.answer(messages.render("replies.save_link_6"))
         else:
-            await message.answer("Отправил таблицу админу на проверку")
+            await message.answer(messages.render("replies.save_link_7"))
         await monitor.deliver()
 
     @router.message(Dialog.remove, F.text, ~F.text.startswith("/"))
-    async def remove_id(message: Message, state: FSMContext):
+    async def remove_id(message: Message, state: FSMContext) -> None:
+        """Handle the remove id interaction."""
         if message.from_user.id != db.admin_id():
             await state.clear()
-            await message.answer("Эта команда больше недоступна")
+            await message.answer(messages.render("replies.remove_id_1"))
             return
         try:
             sheet_id = int(message.text.strip())
         except ValueError:
-            await message.answer("Отправь номер таблицы числом")
+            await message.answer(messages.render("replies.remove_id_2"))
             return
         await ask_remove(message, state, sheet_id)
 
-    async def ask_remove(message, state, sheet_id):
-        rows = ([row] if (row := db.sheet(sheet_id, "approved")) else [])
-        if not rows:
-            await message.answer("Таблица не найдена")
+    async def ask_remove(message: Message, state: FSMContext, sheet_id: int) -> None:
+        """Ask for confirmation before removing a sheet."""
+        sheet = db.sheet(sheet_id, "approved")
+        if sheet is None:
+            await message.answer(messages.render("replies.ask_remove_1"))
             return
         token = secrets.token_hex(8)
         await state.update_data(sheet_id=sheet_id, token=token)
         await state.set_state(Dialog.remove_confirm)
         await message.answer(
-            f"Удалить таблицу «{rows[0]['title']}»?",
+            f"Удалить таблицу «{sheet['title']}»?",
             reply_markup=confirmation("remove", token, "Удалить"),
         )
 
     @router.callback_query(F.data.regexp(r"^pick_(remove|revoke):\d+$"))
-    async def pick_action(callback: CallbackQuery, state: FSMContext):
+    async def pick_action(callback: CallbackQuery, state: FSMContext) -> None:
+        """Handle the pick action interaction."""
         if callback.from_user.id != db.admin_id():
-            await callback.answer("Только для админа", show_alert=True)
+            await callback.answer(messages.render("replies.pick_action_1"), show_alert=True)
             return
         action, identifier = callback.data.split(":")
         await callback.answer()
@@ -1438,7 +1510,8 @@ def create_router(db, monitor, contact_username=""):
             await ask_revoke(callback.message, state, int(identifier))
 
     @router.message(F.text)
-    async def text_message(message: Message, state: FSMContext):
+    async def text_message(message: Message, state: FSMContext) -> None:
+        """Handle the text message interaction."""
         current = await state.get_state()
         prompts = {
             Dialog.title.state: "Жду название предмета",
@@ -1454,13 +1527,16 @@ def create_router(db, monitor, contact_username=""):
         await message.answer(prompts.get(current, help_text(message.from_user.id)), parse_mode="HTML")
 
     @router.message()
-    async def unsupported(message: Message):
-        await message.answer("Отправь текстовое сообщение")
+    async def unsupported(message: Message) -> None:
+        """Handle the unsupported interaction."""
+        await message.answer(messages.render("replies.unsupported_1"))
 
     return router
 
 
-async def run_bot(db, token, interval, contact_username="", proxy_url=None):
+async def run_bot(db: Database, token: str, interval: int, contact_username: str = "",
+                  proxy_url: str | None = None) -> None:
+    """Run polling, cache refresh, and notification delivery."""
     if db.admin_id() is None:
         raise ValueError("Назначьте админа: gradebot admin TELEGRAM_ID")
     async with network_sessions(proxy_url) as (telegram, session), Bot(token=token, session=telegram) as bot:

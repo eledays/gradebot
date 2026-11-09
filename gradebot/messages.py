@@ -22,6 +22,7 @@ class MessageCatalog:
     """Read TOML templates and render their placeholders safely."""
 
     def __init__(self, path: Path | None = None) -> None:
+        """Load packaged templates or a supplied TOML file."""
         source = path or Path(str(files("gradebot").joinpath("messages.toml")))
         with source.open("rb") as handle:
             self._sections: dict[str, dict[str, str]] = tomllib.load(handle)

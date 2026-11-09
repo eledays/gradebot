@@ -1,6 +1,8 @@
 """Shared SOCKS5 configuration for Telegram and Google Sheets transports."""
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import TypedDict
 from urllib.parse import unquote, urlsplit
 
 import aiohttp
@@ -8,11 +10,23 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp_socks import ProxyConnector, ProxyType
 
 
+class ProxyOptions(TypedDict):
+    """Validated SOCKS5 connector arguments."""
+
+    proxy_type: ProxyType
+    host: str
+    port: int
+    username: str | None
+    password: str | None
+    rdns: bool
+
+
 class ProxyConfigurationError(ValueError):
     pass
 
 
-def proxy_options(url):
+def proxy_options(url: str | None) -> ProxyOptions | None:
+    """Validate SOCKS proxy settings for HTTP clients."""
     if not url or not url.strip():
         return None
     try:
@@ -46,7 +60,8 @@ def proxy_options(url):
 
 
 @asynccontextmanager
-async def network_sessions(proxy_url=None):
+async def network_sessions(proxy_url: str | None = None) -> AsyncIterator[tuple[AiohttpSession, aiohttp.ClientSession]]:
+    """Open Telegram and Google HTTP sessions with shared proxy settings."""
     options = proxy_options(proxy_url)
     telegram_proxy, connector = None, None
     if options:

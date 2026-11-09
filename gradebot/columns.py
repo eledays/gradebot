@@ -1,15 +1,29 @@
 """Paginated column selection shared by setup and saved tables."""
 
 from html import escape
+from typing import NotRequired, TypedDict
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .sheets import column_letter
 
+
+class ColumnPickerData(TypedDict):
+    """Saved FSM state for one grade-column selection view."""
+
+    column_title: str
+    column_labels: dict[int, str]
+    column_selected: list[int]
+    column_token: str
+    column_page: NotRequired[int]
+    edit_sheet_id: NotRequired[int]
+
+
 PAGE_SIZE = 8
 
 
-def _escaped_caption(value):
+def _escaped_caption(value: str) -> str:
+    """Escape a column caption for Telegram HTML."""
     result = ""
     for char in value:
         encoded = escape(char)
@@ -19,7 +33,8 @@ def _escaped_caption(value):
     return result
 
 
-def column_picker(data):
+def column_picker(data: ColumnPickerData) -> tuple[str, InlineKeyboardMarkup]:
+    """Build a paginated grade-column selection keyboard."""
     labels = [(int(i), label) for i, label in data["column_labels"].items()]
     selected = set(data["column_selected"])
     total = max(1, (len(labels) + PAGE_SIZE - 1) // PAGE_SIZE)

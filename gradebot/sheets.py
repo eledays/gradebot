@@ -5,12 +5,22 @@ import io
 import json
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from itertools import permutations
+from typing import TypedDict
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
+
+
+class DetectedLayout(TypedDict):
+    """Automatically inferred one-based sheet coordinates."""
+
+    header_start: int
+    header: int
+    columns: tuple[int, ...]
+    grade_columns: tuple[int, ...]
 
 
 class SheetError(ValueError):
@@ -18,6 +28,7 @@ class SheetError(ValueError):
 
 
 def export_url(url: str) -> str:
+    """Validate a Google Sheets URL and build its CSV export URL."""
     parts = urlsplit(url.strip())
     match = re.fullmatch(r"/spreadsheets/d/([A-Za-z0-9_-]{1,200})(?:/[^?]*)?", parts.path)
     if parts.scheme != "https" or parts.netloc != "docs.google.com" or not match:
@@ -40,10 +51,12 @@ def sheet_url(url: str) -> str:
 
 
 def tokens(name: str) -> Counter:
+    """Normalize and count the words in a full name."""
     return Counter(re.findall(r"[^\W\d_]+(?:-[^\W\d_]+)*", name.casefold().replace("ё", "е")))
 
 
 def valid_name(name: str) -> bool:
+    """Check whether a full name has two or three valid words."""
     return (
         len(name) <= 150
         and 2 <= sum(tokens(name).values()) <= 3
@@ -53,6 +66,7 @@ def valid_name(name: str) -> bool:
 
 
 def one_typo(left: str, right: str) -> bool:
+    """Detect one edit or adjacent letter swap."""
     if min(len(left), len(right)) < 4 or abs(len(left) - len(right)) > 1:
         return False
     if len(left) > len(right):
@@ -67,7 +81,8 @@ def one_typo(left: str, right: str) -> bool:
     return any(left == right[:i] + right[i + 1:] for i in range(len(right)))
 
 
-def matches(left: str, right: str, *, fuzzy=True) -> bool:
+def matches(left: str, right: str, *, fuzzy: bool = True) -> bool:
+    """Match names independently of word order with optional typo tolerance."""
     a, b = tokens(left), tokens(right)
     if not (2 <= sum(a.values()) <= 3 and 2 <= sum(b.values()) <= 3):
         return False
@@ -92,8 +107,10 @@ class Sheet:
     name_columns: tuple[int, ...] = (1,)
     header_start: int | None = None
     grade_columns: tuple[int, ...] | None = None
+    labels: dict[int, str] = field(init=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        """Validate sheet layout and derive grade column labels."""
         if self.header_row < 1 or not self.name_columns or min(self.name_columns) < 1:
             raise SheetError("Номера строк и столбцов начинаются с 1")
         if len(self.rows) <= self.header_row:
@@ -147,6 +164,7 @@ class Sheet:
             raise SheetError("Есть данные за пределами заголовков")
 
     def lookup(self, name: str) -> tuple[str, dict[str, str]]:
+        """Find one student row and return their grades."""
         exact_candidates, candidates, fuzzy_candidates = [], [], []
         name_tokens = tokens(name)
         for row in self.rows[self.header_row :]:
@@ -167,8 +185,11 @@ class Sheet:
         return "found", grades
 
 
-async def fetch_sheet(session: aiohttp.ClientSession, url: str, header_row=1, name_columns=(1,),
-                      *, header_start=None, grade_columns=None, raw=False):
+async def fetch_sheet(session: aiohttp.ClientSession, url: str, header_row: int = 1,
+                      name_columns: tuple[int, ...] = (1,), *, header_start: int | None = None,
+                      grade_columns: tuple[int, ...] | None = None,
+                      raw: bool = False) -> Sheet | list[list[str]]:
+    """Download and parse a sheet with size and timeout limits."""
     async with session.get(export_url(url), timeout=aiohttp.ClientTimeout(total=30)) as response:
         if response.status != 200:
             raise SheetError(f"Google вернул HTTP {response.status}; проверьте доступ по ссылке")
@@ -192,7 +213,8 @@ async def fetch_sheet(session: aiohttp.ClientSession, url: str, header_row=1, na
             raise
 
 
-def column_letter(number):
+def column_letter(number: int) -> str:
+    """Convert a one-based column number to a spreadsheet label."""
     result = ""
     while number:
         number, digit = divmod(number - 1, 26)
@@ -200,7 +222,8 @@ def column_letter(number):
     return result
 
 
-def column_number(value):
+def column_number(value: str) -> int:
+    """Convert a spreadsheet label to a one-based column number."""
     value = value.strip().upper()
     if value.isdigit() and int(value) > 0:
         return int(value)
@@ -212,7 +235,8 @@ def column_number(value):
     return result
 
 
-def parse_columns(text, width):
+def parse_columns(text: str, width: int) -> tuple[int, ...]:
+    """Parse a user-supplied list of spreadsheet columns."""
     result = set()
     for item in text.split(","):
         parts = re.split(r"[:-]", item.strip())
@@ -226,12 +250,14 @@ def parse_columns(text, width):
 
 
 class TabsParser(HTMLParser):
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize this component and its state."""
         super().__init__()
         self.tabs, self.gid, self.parts = [], None, []
         self.in_script = False
 
-    def handle_starttag(self, tag, attrs):
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """Collect candidate worksheet links from an HTML start tag."""
         if tag == "script":
             self.in_script = True
         attrs = dict(attrs)
@@ -239,7 +265,8 @@ class TabsParser(HTMLParser):
         if match:
             self.gid, self.parts = match[1], []
 
-    def handle_data(self, data):
+    def handle_data(self, data: str) -> None:
+        """Collect text inside a worksheet link."""
         if self.in_script:
             # Modern htmlview builds its tab menu from these JS records.
             # Read literal strings only; never execute the remote script.
@@ -255,7 +282,8 @@ class TabsParser(HTMLParser):
         if self.gid is not None:
             self.parts.append(data)
 
-    def handle_endtag(self, tag):
+    def handle_endtag(self, tag: str) -> None:
+        """Finish parsing a worksheet link."""
         if tag == "script":
             self.in_script = False
         if tag == "li" and self.gid is not None:
@@ -263,7 +291,8 @@ class TabsParser(HTMLParser):
             self.gid = None
 
 
-async def discover_sheets(session, url):
+async def discover_sheets(session: aiohttp.ClientSession, url: str) -> list[dict[str, str]]:
+    """Find publicly accessible tabs in a Google workbook."""
     canonical = sheet_url(url)
     base = canonical.split("/edit")[0]
     async with session.get(base + "/htmlview", timeout=aiohttp.ClientTimeout(total=30)) as response:
@@ -282,7 +311,7 @@ async def discover_sheets(session, url):
             for gid, name in dict(parser.tabs).items()]
 
 
-def detect_layout(rows):
+def detect_layout(rows: list[list[str]]) -> DetectedLayout:
     """Suggest a layout only when a name header or repeated full names supports it."""
     name_labels = {"фио", "ф.и.о.", "фамилия имя отчество", "фамилия", "имя", "отчество"}
     for index, row in enumerate(rows[:100]):

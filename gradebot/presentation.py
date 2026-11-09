@@ -1,23 +1,33 @@
 """HTML messages and persistent, owner-scoped pagination."""
 
+from __future__ import annotations
+
 import json
 import secrets
+from collections.abc import Sequence
 from html import escape
+from typing import TYPE_CHECKING
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Message
+
+if TYPE_CHECKING:
+    from .db import Database
 
 
-def bold(value):
+def bold(value: object) -> str:
+    """Escape and wrap a value in a Telegram bold tag."""
     return f"<b>{escape(str(value))}</b>"
 
 
-def table_link(title, url):
+def table_link(title: str, url: str) -> str:
+    """Build a safely escaped Telegram HTML link to a sheet."""
     title = " ".join(title.split())
     return f'<a href="{escape(url, quote=True)}">{escape(title)}</a>'
 
 
-def safe_lines(value):
+def safe_lines(value: object) -> list[str]:
     # Split before escaping so HTML entities and Telegram tags remain intact.
+    """Escape and split untrusted text into short lines."""
     return [
         escape(line[offset : offset + 400])
         for line in str(value).split("\n")
@@ -25,7 +35,8 @@ def safe_lines(value):
     ]
 
 
-def paginate(lines, limit=3500):
+def paginate(lines: Sequence[str], limit: int = 3500) -> list[str]:
+    """Split HTML lines into pages within the Telegram message limit."""
     pages, current = [], []
     in_pre = False
     for line in lines:
@@ -45,7 +56,10 @@ def paginate(lines, limit=3500):
     return pages or ["Нет данных"]
 
 
-def create_view(db, owner, lines, *, admin=False, actions=None, pages=None):
+def create_view(db: Database, owner: int, lines: Sequence[str], *, admin: bool = False,
+                actions: list[list[tuple[str, str]]] | dict[str, list[tuple[str, str]]] | None = None,
+                pages: list[str] | None = None) -> tuple[str, list[str]]:
+    """Create an owner-scoped persistent pagination view."""
     pages = pages if pages is not None else paginate(lines)
     view_id = secrets.token_hex(8)
     if isinstance(actions, dict):
@@ -61,7 +75,9 @@ def create_view(db, owner, lines, *, admin=False, actions=None, pages=None):
     return view_id, pages
 
 
-def keyboard(view_id, page, total, actions=()):
+def keyboard(view_id: str, page: int, total: int,
+             actions: Sequence[Sequence[tuple[str, str]]] = ()) -> InlineKeyboardMarkup | None:
+    """Build navigation and action buttons for a page."""
     rows = [[InlineKeyboardButton(text=label, callback_data=data) for label, data in row] for row in actions]
     if total > 1:
         navigation = []
@@ -76,7 +92,8 @@ def keyboard(view_id, page, total, actions=()):
     return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 
-def view_markup(db, view_id, page=0):
+def view_markup(db: Database, view_id: str, page: int = 0) -> InlineKeyboardMarkup | None:
+    """Load a view keyboard while hiding obsolete moderation actions."""
     row = db.view(view_id)
     if row is None:
         return None
@@ -95,7 +112,9 @@ def view_markup(db, view_id, page=0):
     return keyboard(view_id, page, len(json.loads(row["pages"])), [buttons for buttons in actions if buttons])
 
 
-async def send_view(message, db, lines, *, admin=False, actions=None):
+async def send_view(message: Message, db: Database, lines: Sequence[str], *, admin: bool = False,
+                    actions: list[list[tuple[str, str]]] | dict[str, list[tuple[str, str]]] | None = None) -> None:
+    """Persist and send a paginated HTML message."""
     view_id, pages = create_view(db, message.from_user.id, lines, admin=admin, actions=actions)
     await message.answer(
         pages[0],

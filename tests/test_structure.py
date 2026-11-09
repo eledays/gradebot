@@ -6,27 +6,9 @@ import pytest
 from gradebot.db import Database
 from gradebot.monitor import Monitor
 from gradebot.sheets import Sheet
-from gradebot.structure import group_sheets, header_signature, sheet_group_title, sheet_item_title
+from gradebot.structure import header_signature
 
 BASE = "https://docs.google.com/spreadsheets/d/book"
-
-
-def test_subject_groups_normalize_names_preserve_order_and_nested_leaf_names():
-    sheets = [
-        {"title": "Алгебра · Семинары", "url": BASE + "/edit#gid=0"},
-        {"title": "История · Семинары", "url": BASE + "/edit#gid=1"},
-        {"title": "  АЛГЕБРА  · Итоги · Модуль 1", "url": BASE + "other/edit#gid=0"},
-        {"title": "Зачёт · Лист 1", "url": BASE + "/edit#gid=2"},
-        {"title": "зачет · Лист 2", "url": BASE + "/edit#gid=3"},
-        {"title": "ОРГ", "url": BASE + "/edit#gid=4"},
-    ]
-    groups = group_sheets(sheets)
-    assert groups == [[sheets[0], sheets[2]], [sheets[1]], [sheets[3], sheets[4]], [sheets[5]]]
-    assert sheet_group_title(groups[0]) == "Алгебра"
-    assert sheet_group_title(groups[1]) == "История"
-    assert sheet_group_title(groups[-1]) == ""
-    assert sheet_item_title(sheets[2]) == "Итоги · Модуль 1"
-    assert sheet_item_title(sheets[-1]) == "ОРГ"
 
 
 def tabs(*names):

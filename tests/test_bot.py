@@ -172,13 +172,14 @@ async def test_start_checks_tables_and_summarizes_failures(dialog_bot):
     h.monitor.fetch.assert_not_called()
 
 
-async def test_user_cannot_change_admin_assigned_name(dialog_bot):
+async def test_name_change_requires_admin_approval(dialog_bot):
     h = dialog_bot
     await h.send("/start")
     await h.send("/name")
-    assert "администратор" in h.replies()[-1]
+    assert "Администратор" in h.replies()[-1]
     await h.send("Петров Петр")
     assert h.db.all("SELECT name FROM users")[0]["name"] == "Иванов Иван"
+    assert h.db.name_request(123) == "Петров Петр"
     assert await h.state() is None
 
 
@@ -381,14 +382,14 @@ async def test_grades_and_tables_each_send_one_cached_message(dialog_bot):
     h.monitor.fetch.assert_not_called()
 
 
-async def test_grades_group_tabs_as_children_without_actions(dialog_bot):
+async def test_grades_group_tabs_with_full_titles_and_no_actions(dialog_bot):
     import json
 
     h = dialog_bot
     h.db.register(123, "Иванов Иван")
     for index, (book, title) in enumerate([
         ("org", "ОРГ"), ("algebra", "Алгебра · Семинары"),
-        ("other", "Другой предмет"), ("another_file", "Алгебра · КР 1"),
+        ("other", "Другой предмет"), ("algebra", "Алгебра · КР 1"),
     ]):
         h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
                        1, (1,), 999, "approved",
@@ -396,11 +397,10 @@ async def test_grades_group_tabs_as_children_without_actions(dialog_bot):
     h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
     await h.send("/grades")
     text = h.replies()[-1]
-    assert text.index(">ОРГ</a>") < text.index("<b>Алгебра</b>") < text.index(">Семинары</a>")
-    assert text.index(">Семинары</a>") < text.index(">КР 1</a>") < text.index(">Другой предмет</a>")
-    assert text.count("<b>Алгебра</b>") == 1
-    assert text.count("↳ <b><a href=") == 2
-    assert "Алгебра ·" not in text
+    assert text.index(">ОРГ</a>") < text.index(">Алгебра · Семинары</a>")
+    assert text.index(">Алгебра · Семинары</a>") < text.index(">Алгебра · КР 1</a>")
+    assert text.index(">Алгебра · КР 1</a>") < text.index(">Другой предмет</a>")
+    assert "<b>Алгебра</b>" not in text
     assert text.count("- С1: 5") == 4 and "- С1: 2" not in text
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
     assert json.loads(view["actions"]) == []
@@ -458,7 +458,7 @@ async def test_tables_group_workbook_tabs_without_action_buttons(dialog_bot):
 
     h = dialog_bot
     titles = ["ОРГ", "Алгебра · Семинары 1 модуль", "Другая таблица", "Алгебра · КР 1"]
-    urls = ["org", "algebra", "other", "another_file"]
+    urls = ["org", "algebra", "other", "algebra"]
     for index, (title, book) in enumerate(zip(titles, urls, strict=True)):
         h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
                        1, (1,), 999, "approved",
@@ -467,7 +467,7 @@ async def test_tables_group_workbook_tabs_without_action_buttons(dialog_bot):
     h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
     await h.send("/tables", 999)
     text = h.replies()[-1]
-    assert '<b>Алгебра</b>\n↳ #2: <a href=' in text
+    assert '<b>Алгебра</b>\n#2: <a href=' in text
     assert ">Семинары 1 модуль</a>" in text and ">КР 1</a>" in text
     assert "Алгебра ·" not in text
     assert text.index("#1:") < text.index("#2:") < text.index("#4:") < text.index("#3:")
@@ -511,7 +511,7 @@ async def test_table_group_cache_status_includes_all_tabs(dialog_bot, monkeypatc
         assert text.count("Последнее обновление:") == 1
 
 
-async def test_table_groups_use_subject_name_and_escape_titles(dialog_bot):
+async def test_table_groups_use_workbook_identity_and_escape_titles(dialog_bot):
     h = dialog_bot
     for index, (book, title) in enumerate([
         ("first", "Алгебра <1> · Семинар & КР"),
@@ -526,9 +526,8 @@ async def test_table_groups_use_subject_name_and_escape_titles(dialog_bot):
     text = h.replies()[-1]
     assert text.count("<b>Алгебра &lt;1&gt;</b>") == 1
     assert ">Семинар &amp; КР</a>" in text and ">Итоги · Модуль 1</a>" in text
-    assert ">Экзамен</a>" in text
-    assert "<b>Листы одной таблицы</b>" not in text
-    assert text.index(">Экзамен</a>") < text.index(">Старое название</a>")
+    assert ">Алгебра &lt;1&gt; · Экзамен</a>" in text  # Another file remains a single table.
+    assert "<b>Листы одной таблицы</b>" in text
     assert ">Старое название</a>" in text and ">Отдельное название</a>" in text
 
 
@@ -684,7 +683,7 @@ async def test_start_opens_admin_menu_without_student_registration(dialog_bot):
     assert "Панель администратора" in h.replies()[-1]
     method = h.bot.session.await_args.args[1]
     labels = [button.text for row in method.reply_markup.keyboard for button in row]
-    assert "Добавить пользователей" in labels
+    assert "Создать ссылку" in labels
     assert "Добавить таблицу" in labels
     assert not h.db.all("SELECT * FROM users")
 

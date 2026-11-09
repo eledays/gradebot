@@ -8,9 +8,11 @@ from dotenv import load_dotenv
 
 from .db import Database
 from .logging_setup import audit, configure_logging
+from .runtime import migrate_legacy_database
 
 
-def main():
+def main() -> None:
+    """Run the command-line entry point with safe error reporting."""
     try:
         _main()
     except Exception as exc:
@@ -18,7 +20,8 @@ def main():
         raise SystemExit("Бот завершил работу из-за ошибки; проверьте журнал событий") from None
 
 
-def _main():
+def _main() -> None:
+    """Parse configuration and start administrator setup or polling."""
     load_dotenv(Path.cwd() / ".env", override=False)
     parser = argparse.ArgumentParser(description="Telegram grade bot for one university group")
     parser.add_argument("--db", default=os.getenv("DATABASE_PATH", "instance/grades.sqlite3"))
@@ -32,6 +35,7 @@ def _main():
         configure_logging(os.getenv("LOG_LEVEL", "INFO").upper())
     except ValueError as exc:
         parser.error(str(exc))
+    migrate_legacy_database(args.db)
     db = Database(args.db)
     try:
         if args.command == "admin":
