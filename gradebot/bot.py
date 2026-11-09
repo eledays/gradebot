@@ -11,7 +11,7 @@ from typing import Any, cast
 
 import aiohttp
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -34,6 +34,7 @@ from .messages import TrustedHtml, messages
 from .monitor import GradeReport, Monitor, cache_caption, format_grades, subject_pages
 from .network import network_sessions
 from .presentation import bold, create_view, safe_lines, send_view, table_link, view_markup
+from .selection import selection_button
 from .sheets import (
     Sheet,
     SheetError,
@@ -213,6 +214,49 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
     menu_labels = {button.text for row in menu(True).keyboard for button in row}
+    check_emoji_id: str | None = None
+    check_emoji_checked = False
+    check_emoji_usable = True
+
+    async def selected_check(bot: Bot) -> str | None:
+        """Resolve ✅ from TgAndroidIcons once, using Unicode if unavailable."""
+        nonlocal check_emoji_id, check_emoji_checked
+        if not check_emoji_checked:
+            check_emoji_checked = True
+            try:
+                sticker_set = await bot.get_sticker_set("TgAndroidIcons")
+                stickers = getattr(sticker_set, "stickers", None)
+                if isinstance(stickers, list):
+                    check_emoji_id = next((sticker.custom_emoji_id for sticker in stickers
+                                           if sticker.emoji == "✅" and sticker.custom_emoji_id), None)
+            except (TelegramAPIError, aiohttp.ClientError, TimeoutError):
+                pass
+        return check_emoji_id if check_emoji_usable else None
+
+    async def with_selection_icon(bot: Bot, operation: Callable[[str | None], Awaitable[Any]]) -> Any:
+        """Retry a selection keyboard with Unicode if Telegram rejects its icon."""
+        nonlocal check_emoji_usable
+        icon = await selected_check(bot)
+        try:
+            return await operation(icon)
+        except TelegramBadRequest:
+            if icon is None:
+                raise
+            check_emoji_usable = False
+            return await operation(None)
+
+    async def delete_temporary(message: Message) -> None:
+        """Remove a transient progress message once the next step is ready."""
+        with contextlib.suppress(TelegramBadRequest):
+            await message.delete()
+
+    async def delete_step(message: Message) -> None:
+        """Remove an old setup message, clearing its buttons if Telegram refuses deletion."""
+        try:
+            await message.delete()
+        except TelegramBadRequest:
+            with contextlib.suppress(TelegramBadRequest):
+                await message.edit_reply_markup(reply_markup=None)
 
     def help_text(user_id: int) -> str:
         """Render help with the current cache time and user role."""
@@ -594,8 +638,13 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         """Show selectable grade columns."""
         await state.update_data(column_labels=labels, column_selected=list(selected), column_page=0,
                                 column_title=title, column_token=secrets.token_hex(8))
-        text, markup = column_picker(cast(ColumnPickerData, await state.get_data()))
-        await message.answer(text, parse_mode="HTML", reply_markup=markup)
+        data = cast(ColumnPickerData, await state.get_data())
+
+        async def send(icon: str | None) -> Any:
+            text, markup = column_picker(data, check_emoji_id=icon)
+            return await message.answer(text, parse_mode="HTML", reply_markup=markup)
+
+        await with_selection_icon(message.bot, send)
 
     @router.callback_query(F.data.regexp(r"^colpick:[a-f0-9]{16}:(\d+|page\d+|all|done|cancel)$"))
     async def select_column(callback: CallbackQuery, state: FSMContext) -> None:
@@ -629,7 +678,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                     await callback.answer(str(exc)[:180], show_alert=True)
                     return
             await callback.answer("Сохранено" if action == "done" else "Отменено")
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await delete_step(callback.message)
             if data.get("edit_sheet_id"):
                 await state.clear()
                 await callback.message.answer(
@@ -658,9 +707,14 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                 return
         await state.update_data(column_selected=sorted(selected))
         await callback.answer()
-        text, markup = column_picker(cast(ColumnPickerData, await state.get_data()))
+        data = cast(ColumnPickerData, await state.get_data())
+
+        async def edit(icon: str | None) -> Any:
+            text, markup = column_picker(data, check_emoji_id=icon)
+            return await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
         try:
-            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+            await with_selection_icon(callback.bot, edit)
         except TelegramBadRequest as exc:
             if "message is not modified" not in str(exc):
                 raise
@@ -679,7 +733,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         await state.clear()
         await state.update_data(direct=direct, header=1, columns=(1,))
-        await state.set_state(Dialog.title)
+        await state.set_state(Dialog.link)
         await message.answer(messages.render("replies.add_3"))
 
     @router.message(F.text == "Добавить лист")
@@ -721,11 +775,19 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         """Start discovering tabs of an existing approved workbook."""
         await state.clear()
         await state.update_data(title=source["title"], direct=True, extension_source=source["id"])
+        busy = await message.answer(messages.render("replies.busy"))
         try:
-            await begin_workbook(message, state, source["url"], existing_urls=set(source["existing_urls"]))
+            await begin_workbook(message, state, source["url"], existing_urls=set(source["existing_urls"]),
+                                 busy=busy)
+            busy = None
         except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
             await state.clear()
+            await delete_temporary(busy)
+            busy = None
             await message.answer(messages.render("replies.add_tab_failed", reason=str(exc)))
+        finally:
+            if busy is not None:
+                await delete_temporary(busy)
 
     @router.callback_query(F.data.regexp(r"^extend:\d+$"))
     async def extend_workbook(callback: CallbackQuery, state: FSMContext) -> None:
@@ -746,7 +808,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
     async def layout(message: Message, state: FSMContext) -> None:
         # Optional advanced configuration; the normal flow only asks for title and link.
         """Handle the layout interaction."""
-        if await state.get_state() != Dialog.link.state:
+        if await state.get_state() != Dialog.title.state:
             await message.answer(messages.render("replies.layout_1"))
             return
         try:
@@ -1087,18 +1149,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             if offer_empty_table is not None:
                 await ask_remove_table(callback.message, state, offer_empty_table, after_last_sheet=True)
 
-    async def setup_view(message: Message, lines: Sequence[str]) -> None:
-        """Send a paginated administrator setup view."""
-        view_id, pages = create_view(db, db.admin_id(), safe_lines("\n".join(lines)), admin=True)
-        await message.answer(pages[0], parse_mode="HTML", reply_markup=view_markup(db, view_id),
-                             link_preview_options=LinkPreviewOptions(is_disabled=True))
-
     def proposal_picker(identifier: int, data: dict[str, Any],
-                        page: int = 0) -> InlineKeyboardMarkup:
+                        page: int = 0, *, check_emoji_id: str | None = None) -> InlineKeyboardMarkup:
         """Build the keyboard for selecting proposal tabs."""
         tabs, selected = data["tabs"], set(data["selected"])
-        rows = [[InlineKeyboardButton(text=("✓ " if i in selected else "○ ") + tab["name"][:50],
-                                      callback_data=f"ptabs:{identifier}:{i}")]
+        rows = [[selection_button(tab["name"][:50], f"ptabs:{identifier}:{i}", i in selected,
+                                  check_emoji_id=check_emoji_id)]
                 for i, tab in enumerate(tabs) if page * 15 <= i < (page + 1) * 15]
         pages = (len(tabs) + 14) // 15
         if pages > 1:
@@ -1107,7 +1163,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         rows.extend([
             [InlineKeyboardButton(text="Снять выделение" if len(selected) == len(tabs) else "Выбрать все",
                                   callback_data=f"ptabs:{identifier}:all")],
-            [InlineKeyboardButton(text="Настроить выбранные листы", callback_data=f"configure:{identifier}"),
+            [InlineKeyboardButton(text=messages.render("replies.setup_next"),
+                                  callback_data=f"configure:{identifier}"),
              InlineKeyboardButton(text="Отклонить", callback_data=f"reject:{identifier}")],
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1146,15 +1203,16 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         db.set_parser_options(int(identifier), data)
         await callback.answer()
         if isinstance(callback.message, Message):
-            await callback.message.edit_reply_markup(reply_markup=proposal_picker(identifier, data, page))
+            await with_selection_icon(callback.bot, lambda icon: callback.message.edit_reply_markup(
+                reply_markup=proposal_picker(identifier, data, page, check_emoji_id=icon)))
 
-    def sheet_picker(data: dict[str, Any], page: int = 0) -> InlineKeyboardMarkup:
+    def sheet_picker(data: dict[str, Any], page: int = 0, *,
+                     check_emoji_id: str | None = None) -> InlineKeyboardMarkup:
         """Build the keyboard for selecting workbook tabs."""
         tabs, selected, token = data["tabs"], set(data["selected"]), data["setup_token"]
-        rows = [[InlineKeyboardButton(
-            text=("✓ " if i in selected else "○ ") + tab["name"][:50],
-            callback_data=f"tabs:{token}:{i}",
-        )] for i, tab in enumerate(tabs) if page * 15 <= i < (page + 1) * 15]
+        rows = [[selection_button(tab["name"][:50], f"tabs:{token}:{i}", i in selected,
+                                  check_emoji_id=check_emoji_id)]
+                for i, tab in enumerate(tabs) if page * 15 <= i < (page + 1) * 15]
         pages = (len(tabs) + 14) // 15
         if pages > 1:
             rows.append([InlineKeyboardButton(text=f"{p + 1}", callback_data=f"tabpage:{token}:{p}")
@@ -1162,18 +1220,23 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         rows.extend([
             [InlineKeyboardButton(text="Снять выделение" if len(selected) == len(tabs) else "Выбрать все",
                                   callback_data=f"tabs:{token}:all")],
-            [InlineKeyboardButton(text="Настроить выбранные листы", callback_data=f"tabs:{token}:next")],
+            [InlineKeyboardButton(text=messages.render("replies.setup_next"),
+                                  callback_data=f"tabs:{token}:next")],
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def begin_workbook(message: Message, state: FSMContext, url: str, *,
-                             existing_urls: set[str] | None = None) -> None:
+                             existing_urls: set[str] | None = None,
+                             busy: Message | None = None) -> None:
         """Start guided workbook setup from a sheet URL."""
         all_tabs = await discover_sheets(monitor.session, url)
         tabs = [tab for tab in all_tabs if sheet_url(tab["url"]) not in existing_urls] if existing_urls else all_tabs
         if not tabs:
             await state.clear()
-            await message.answer(messages.render("replies.add_tab_none"))
+            if busy is not None:
+                await delete_temporary(busy)
+            await message.answer(messages.render("replies.add_tab_none" if existing_urls is not None
+                                                 else "replies.add_no_tabs"))
             return
         data = await state.get_data()
         title = data.get("title", "")
@@ -1185,8 +1248,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                                 setup_token=secrets.token_hex(8),
                                 tab_page=0, configured=[])
         await state.set_state(Dialog.sheet_selection)
-        await message.answer(messages.render("replies.begin_workbook_1"),
-                             reply_markup=sheet_picker(await state.get_data()))
+        if busy is not None:
+            await delete_temporary(busy)
+        data = await state.get_data()
+        await with_selection_icon(message.bot, lambda icon: message.answer(
+            messages.render("replies.begin_workbook_1"),
+            reply_markup=sheet_picker(data, check_emoji_id=icon)))
 
     async def configure_next(message: Message, state: FSMContext) -> None:
         """Advance to the next selected workbook tab."""
@@ -1194,26 +1261,29 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         remaining = [i for i in data["selected"] if i not in [c["index"] for c in data["configured"]]]
         if not remaining:
             await state.set_state(Dialog.workbook_confirm)
-            lines = ["Готово к сохранению:"]
+            lines = [messages.render("replies.setup_ready")]
             for item in data["configured"]:
-                lines.append(f"{item['title']}: {len(item['grade_columns'])} столбцов оценок")
-            await setup_view(message, lines)
-            await message.answer(messages.render("replies.configure_next_1"), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="Сохранить", callback_data=f"worksave:{data['setup_token']}")
-            ]]))
+                lines.append(messages.render("replies.setup_ready_sheet", title=data["title"],
+                                             tab_name=item["tab_name"], count=len(item["grade_columns"])))
+            await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="Сохранить",
+                                                     callback_data=f"worksave:{data['setup_token']}")]]))
             return
         index = remaining[0]
         tab = data["tabs"][index]
+        busy = await message.answer(messages.render("replies.busy"))
         try:
             rows = await fetch_sheet(monitor.session, tab["url"], raw=True)
             if not rows or len(rows) < 2:
                 raise SheetError("На листе нет строк данных")
         except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
+            await delete_temporary(busy)
             await message.answer(f"Не удалось прочитать лист «{tab['name']}»: {exc}\n"
                                  "Отправь «повторить» или «пропустить»")
             await state.update_data(current_index=index)
             await state.set_state(Dialog.sheet_retry)
             return
+        await delete_temporary(busy)
         await state.update_data(current_index=index, raw_rows=rows)
         try:
             layout = detect_layout(rows)
@@ -1221,8 +1291,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await state.set_state(Dialog.sheet_columns)
             await show_columns(message, state)
         except SheetError:
-            await message.answer(f"Лист «{tab['name']}»: не удалось определить структуру автоматически")
-            await request_layout(message, state)
+            await request_layout(message, state, automatic_failure=True)
 
     @router.callback_query(F.data.regexp(r"^(tabs|tabpage):[a-f0-9]{16}:(\d+|all|next)$"))
     async def select_tabs(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1248,7 +1317,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                 return
             await callback.answer()
             if isinstance(callback.message, Message):
-                await callback.message.edit_reply_markup(reply_markup=None)
+                await delete_step(callback.message)
                 await configure_next(callback.message, state)
             return
         elif value == "all":
@@ -1263,7 +1332,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await callback.answer()
         if isinstance(callback.message, Message):
             data = await state.get_data()
-            await callback.message.edit_reply_markup(reply_markup=sheet_picker(data, data["tab_page"]))
+            await with_selection_icon(callback.bot, lambda icon: callback.message.edit_reply_markup(
+                reply_markup=sheet_picker(data, data["tab_page"], check_emoji_id=icon)))
 
     async def skip_current(message: Message, state: FSMContext) -> None:
         """Skip the current workbook tab."""
@@ -1290,26 +1360,22 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         """Build the keyboard for parser setup."""
         prefix = f"sheetcfg:{data['setup_token']}:{data['current_index']}"
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Далее →", callback_data=prefix + ":next")],
-            [InlineKeyboardButton(text="Только итоги", callback_data=prefix + ":totals"),
-             InlineKeyboardButton(text="Все оценки", callback_data=prefix + ":all")],
+            [InlineKeyboardButton(text=messages.render("replies.setup_next"), callback_data=prefix + ":next")],
             [InlineKeyboardButton(text="Исключить столбцы", callback_data=prefix + ":details"),
              InlineKeyboardButton(text="Исправить структуру", callback_data=prefix + ":layout")],
             [InlineKeyboardButton(text="Пропустить лист", callback_data=prefix + ":skip")],
         ])
 
-    async def request_layout(message: Message, state: FSMContext) -> None:
+    async def request_layout(message: Message, state: FSMContext, *,
+                             automatic_failure: bool = False) -> None:
         """Ask for header and name column layout."""
         data = await state.get_data()
         await state.set_state(Dialog.sheet_layout)
-        # A compact header-only sample is enough for manual correction.
-        lines = ["Укажи строки заголовков и ФИО, например: 1-3 | B"]
-        for n, row in enumerate(data["raw_rows"][:min(4, data.get("header", 3))], 1):
-            cells = [f"{column_letter(i)}: {value[:45]}" for i, value in enumerate(row, 1) if value.strip()]
-            lines.append(f"Строка {n}: " + "; ".join(cells[:5]) + ("; …" if len(cells) > 5 else ""))
-        await message.answer("\n".join(lines))
+        key = "replies.setup_manual_layout" if automatic_failure else "replies.setup_edit_layout"
+        values = {"tab_name": data["tabs"][data["current_index"]]["name"]} if automatic_failure else {}
+        await message.answer(messages.render(key, **values), parse_mode="HTML")
 
-    @router.callback_query(F.data.regexp(r"^sheetcfg:[a-f0-9]{16}:\d+:(next|totals|all|details|layout|skip)$"))
+    @router.callback_query(F.data.regexp(r"^sheetcfg:[a-f0-9]{16}:\d+:(next|details|layout|skip)$"))
     async def sheet_setup_action(callback: CallbackQuery, state: FSMContext) -> None:
         """Handle the sheet setup action interaction."""
         data = await state.get_data()
@@ -1324,8 +1390,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await callback.answer()
         if not isinstance(callback.message, Message):
             return
-        if action in {"next", "skip", "layout"}:
-            await callback.message.edit_reply_markup(reply_markup=None)
+        await delete_step(callback.message)
         if action == "next":
             await accept_current(callback.message, state)
         elif action == "skip":
@@ -1334,16 +1399,6 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await request_layout(callback.message, state)
         elif action == "details":
             await show_columns(callback.message, state, detailed=True)
-        else:
-            parsed = Sheet(data["raw_rows"], data["header"], tuple(data["columns"]), data["header_start"])
-            selected = [i for i, label in parsed.labels.items()
-                        if label.strip().casefold() not in {"№", "номер", "п/п", "№ п/п"}
-                        and (action == "all" or "итог" in label.casefold())]
-            if not selected:
-                await callback.message.answer(messages.render("replies.sheet_setup_action_3"))
-                return
-            await state.update_data(grade_columns=selected)
-            await show_columns(callback.message, state)
 
     async def accept_current(message: Message, state: FSMContext) -> None:
         """Validate and store the current tab configuration."""
@@ -1379,24 +1434,26 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         headers = str(data["header"]) if data["header_start"] == data["header"] else (
             f"{data['header_start']}–{data['header']}")
         names = ", ".join(column_letter(i) for i in data["columns"])
-        lines = [f"Лист {len(data['configured']) + 1}/{len(data['selected'])}: {tab['name']}",
-                 f"ФИО: {names} · Заголовки: строки {headers}",
-                 f"Выбрано столбцов оценок: {len(parsed.labels)}", "", "Примеры:"]
+        lines = [messages.render("replies.setup_preview", index=len(data["configured"]) + 1,
+                                 total=len(data["selected"]), tab_name=tab["name"], names=names,
+                                 headers=headers, count=len(parsed.labels))]
         sample = next((row for row in parsed.rows[parsed.header_row:]
                        if valid_name(" ".join(row[i - 1] if i <= len(row) else ""
                                               for i in parsed.name_columns))), None)
         for column, label in list(parsed.labels.items())[:3]:
             value = " ".join(sample[column - 1].split()) if sample is not None and column <= len(sample) else ""
             preview = (value[:60] + ("…" if len(value) > 60 else "")) if value else "пусто"
-            lines.append(f"• {label[:170]}: {preview}" if sample is not None else f"• {label[:170]}")
+            lines.append(f"- {escape(label[:170])}: {escape(preview)}" if sample is not None
+                         else f"- {escape(label[:170])}")
         if sample is None:
             lines.append("Нет строки с ФИО для примера значений")
         if len(parsed.labels) > 3:
             lines.append(f"… и ещё {len(parsed.labels) - 3}")
-        await message.answer("\n".join(lines), reply_markup=setup_keyboard(data))
+        await message.answer("\n".join(lines), parse_mode="HTML", reply_markup=setup_keyboard(data))
         return True
 
     @router.message(Dialog.sheet_columns, F.text.contains("|"), ~F.text.startswith("/"))
+    @router.message(Dialog.sheet_columns, F.text.contains("\n"), ~F.text.startswith("/"))
     @router.message(Dialog.sheet_layout, F.text, ~F.text.startswith("/"))
     async def workbook_layout(message: Message, state: FSMContext) -> None:
         """Handle the workbook layout interaction."""
@@ -1411,7 +1468,10 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             if message.text.strip().casefold() == "по умолчанию":
                 headers, names = str(data["header"]), ",".join(str(i) for i in data["columns"])
             else:
-                headers, names = message.text.split("|")
+                parts = message.text.split("|", 1) if "|" in message.text else message.text.splitlines()
+                if len(parts) != 2:
+                    raise ValueError
+                headers, names = parts
             bounds = headers.strip().split("-")
             if len(bounds) > 2:
                 raise ValueError
@@ -1532,84 +1592,88 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                         return
                     await state.update_data(tabs=selection["tabs"], selected=selection["selected"],
                                             configured=[], setup_token=secrets.token_hex(8), tab_page=0)
+                    await delete_step(callback.message)
                     await configure_next(callback.message, state)
                 else:
+                    await delete_step(callback.message)
                     await begin_workbook(callback.message, state, row["url"])
             except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
                 await callback.message.answer(f"Не удалось найти листы: {exc}. Нажми «Настроить» ещё раз")
 
     @router.message(Dialog.title, F.text, ~F.text.startswith("/"))
     async def save_title(message: Message, state: FSMContext) -> None:
-        """Handle the save title interaction."""
+        """Validate the title and discover sheets for the submitted link."""
         title = message.text.strip()
         if not title or len(title) > 200 or "\n" in title:
             await message.answer(messages.render("replies.save_title_1"))
             return
         if db.title_exists(title):
-            await message.answer(
-                messages.render("replies.save_title_2")
-            )
+            await message.answer(messages.render("replies.save_title_2"))
             return
         await state.update_data(title=title)
-        await state.set_state(Dialog.link)
-        await message.answer(messages.render("replies.save_title_3"))
-
-    @router.message(Dialog.link, F.text, ~F.text.startswith("/"))
-    async def save_link(message: Message, state: FSMContext) -> None:
-        """Handle the save link interaction."""
         data = await state.get_data()
         direct = data["direct"]
         if direct and message.from_user.id != db.admin_id():
             await state.clear()
             await message.answer(messages.render("replies.save_link_1"))
             return
+        busy = await message.answer(messages.render("replies.busy"))
         try:
-            url = sheet_url(message.text.strip())
-            await message.answer(messages.render("replies.save_link_2"))
             if direct:
-                if db.title_exists(data["title"]):
-                    raise DuplicateTitleError(data["title"])
-                await begin_workbook(message, state, url)
+                await begin_workbook(message, state, data["url"], busy=busy)
+                busy = None
                 return
-            tabs = await discover_sheets(monitor.session, url)
-            parsed = None
-            if not db.authorized(message.from_user.id) or (direct and message.from_user.id != db.admin_id()):
+            tabs = await discover_sheets(monitor.session, data["url"])
+            if not db.authorized(message.from_user.id):
                 await state.clear()
+                await delete_temporary(busy)
+                busy = None
                 await message.answer(messages.render("replies.save_link_3"))
                 return
             proposal_id = db.add_sheet(
-                data["title"],
-                url,
-                data["header"],
-                data["columns"],
-                message.from_user.id,
-                "approved" if direct else "pending",
-                parsed=parsed,
-                notify=False,
+                title, data["url"], data["header"], data["columns"], message.from_user.id,
+                "pending", notify=False,
             )
             selection = {"tabs": tabs, "selected": list(range(len(tabs))), "page": 0}
             markup = proposal_picker(proposal_id, selection)
             actions = [[(button.text, button.callback_data) for button in row]
                        for row in markup.inline_keyboard]
-            db.save_proposal_selection(proposal_id, selection, db.admin_id(),
-                                       data["title"], url, message.from_user.id, actions)
+            db.save_proposal_selection(proposal_id, selection, db.admin_id(), title, data["url"],
+                                       message.from_user.id, actions)
         except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
             audit("sheet_input_failed", level=logging.WARNING, error=exc)
-            await message.answer(f"Не удалось прочитать таблицу: {exc}")
+            await delete_temporary(busy)
+            busy = None
+            await message.answer(messages.render("replies.add_tab_failed", reason=str(exc)))
             return
         except DuplicateTitleError:
-            await state.set_state(Dialog.title)
-            await message.answer(messages.render("replies.save_link_4"))
+            await delete_temporary(busy)
+            busy = None
+            await message.answer(messages.render("replies.save_title_2"))
             return
         except sqlite3.IntegrityError:
+            await delete_temporary(busy)
+            busy = None
             await message.answer(messages.render("replies.save_link_5"))
             return
+        finally:
+            if busy is not None:
+                await delete_temporary(busy)
         await state.clear()
-        if direct:
-            await message.answer(messages.render("replies.save_link_6"))
-        else:
-            await message.answer(messages.render("replies.save_link_7"))
+        await message.answer(messages.render("replies.save_link_7"))
         await monitor.deliver()
+
+    @router.message(Dialog.link, F.text, ~F.text.startswith("/"))
+    async def save_link(message: Message, state: FSMContext) -> None:
+        """Store the Google link before requesting a table title."""
+        try:
+            url = sheet_url(message.text.strip())
+        except SheetError as exc:
+            await message.answer(messages.render("replies.link_invalid", reason=str(exc)))
+            return
+        await state.update_data(url=url)
+        await state.set_state(Dialog.title)
+        await message.answer(messages.render("replies.save_link_valid"))
 
     @router.message(Dialog.remove, F.text, ~F.text.startswith("/"))
     async def remove_id(message: Message, state: FSMContext) -> None:

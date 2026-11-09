@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 from .logging_setup import audit
-from .messages import TrustedHtml, messages
+from .messages import messages
 from .presentation import bold, create_view, table_link
 from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
@@ -511,13 +511,17 @@ class Database:
 
     def broadcast_table(self, title: str, url: str) -> None:
         """Queue a new-sheet announcement for active users."""
+        self.broadcast_sheets([(title, url)])
+
+    def broadcast_sheets(self, sheets: Sequence[tuple[str, str]]) -> None:
+        """Queue one announcement per user for all newly approved sheets."""
+        if not sheets:
+            return
+        links = [table_link(self.grade_display_title(title, url), url) for title, url in sheets]
+        key = "notifications.new_sheet" if len(sheets) == 1 else "notifications.new_sheets"
+        announcement = [messages.render(key), *links]
         for user in self.notification_users():
-            self.queue(
-                user["telegram_id"],
-                [messages.render("notifications.new_sheet",
-                                 sheet=TrustedHtml(table_link(self.grade_display_title(title, url), url)))],
-                kind="table",
-            )
+            self.queue(user["telegram_id"], announcement, kind="table")
 
     def has_join_draft(self, user_id: int) -> bool:
         """Return whether a user is entering a name through an invitation."""
@@ -730,8 +734,7 @@ class Database:
                                workbook_id=workbook_id, tab_name=item["tab_name"])
             all_tabs = data.get("all_tabs", data["tabs"])
             self.remember_workbook(all_tabs[0]["url"], all_tabs, replace=bool(extension))
-            for item in configured:
-                self.broadcast_table(item["title"], item["url"])
+            self.broadcast_sheets([(item["title"], item["url"]) for item in configured])
             if proposal:
                 self.queue(data["proposer"], [bold("Таблица одобрена"),
                            table_link(data["title"], data["url"])], kind="moderation")
@@ -746,7 +749,7 @@ class Database:
             self.set_parser_options(sheet_id, selection)
             self.queue(admin_id, [bold(f"Предложение #{sheet_id}"), table_link(title, url),
                      f"От пользователя {proposer}",
-                     "Выбери листы для парсинга (по умолчанию выбраны все)"],
+                     messages.render("replies.begin_workbook_1")],
                      kind="proposal", admin=True, actions=actions)
 
     def store_view(self, view_id: str, owner: int, pages: list[str], admin: bool,

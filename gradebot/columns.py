@@ -5,6 +5,8 @@ from typing import NotRequired, TypedDict
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from .messages import messages
+from .selection import selection_button
 from .sheets import column_letter
 
 
@@ -33,7 +35,8 @@ def _escaped_caption(value: str) -> str:
     return result
 
 
-def column_picker(data: ColumnPickerData) -> tuple[str, InlineKeyboardMarkup]:
+def column_picker(data: ColumnPickerData, *, check_emoji_id: str | None = None
+                  ) -> tuple[str, InlineKeyboardMarkup]:
     """Build a paginated grade-column selection keyboard."""
     labels = [(int(i), label) for i, label in data["column_labels"].items()]
     selected = set(data["column_selected"])
@@ -41,14 +44,15 @@ def column_picker(data: ColumnPickerData) -> tuple[str, InlineKeyboardMarkup]:
     page = min(data.get("column_page", 0), total - 1)
     prefix = f"colpick:{data['column_token']}:"
     lines = [f"<b>{_escaped_caption(data['column_title'][:200])}</b>",
-             "Нажми на столбец, чтобы исключить его или вернуть.",
-             "✓ — отслеживается · ○ — исключён",
-             f"Выбрано: {len(selected)} из {len(labels)}", ""]
+             messages.render("replies.columns_picker_hint"),
+             messages.render("replies.columns_picker_legend"),
+             messages.render("replies.columns_picker_count", selected=len(selected), total=len(labels)), ""]
     buttons = []
     for index, label in labels[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]:
-        caption = f"{'✓' if index in selected else '○'} {column_letter(index)}: {label}"
+        caption = f"{'✅ ' if index in selected else ''}{column_letter(index)}: {label}"
         lines.append(_escaped_caption(caption[:220]))
-        buttons.append([InlineKeyboardButton(text=caption[:60], callback_data=prefix + str(index))])
+        buttons.append([selection_button(f"{column_letter(index)}: {label}"[:60], prefix + str(index),
+                                        index in selected, check_emoji_id=check_emoji_id)])
     if total > 1:
         navigation = []
         if page:

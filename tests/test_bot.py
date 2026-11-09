@@ -194,14 +194,14 @@ async def test_add_keeps_title_and_link_state_after_parse_error(dialog_bot, monk
         "name": "Лист 1", "url": "https://docs.google.com/spreadsheets/d/id/edit#gid=0"}]])
     monkeypatch.setattr("gradebot.bot.discover_sheets", discover)
     await h.send("/add", 999)
+    assert await h.state(999) == Dialog.link.state
+    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
     assert await h.state(999) == Dialog.title.state
     await h.send("Матан", 999)
-    assert await h.state(999) == Dialog.link.state
-    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
     assert "Не удалось прочитать" in h.replies()[-1]
-    assert await h.state(999) == Dialog.link.state
+    assert await h.state(999) == Dialog.title.state
     assert not h.db.all("SELECT * FROM sheets")
-    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
     await h.send("1 | A", 999)
@@ -222,11 +222,70 @@ async def test_suggest_saves_pending_and_notifies_admin(dialog_bot, monkeypatch)
         "gradebot.bot.fetch_sheet", AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
     )
     await h.send("/suggest")
-    await h.send("Матан")
     await h.send("https://docs.google.com/spreadsheets/d/id/edit")
+    await h.send("Матан")
     assert h.db.all("SELECT status FROM sheets")[0]["status"] == "pending"
     assert any("Отправил таблицу админу" in reply for reply in h.replies())
     assert h.bot.session.await_args_list[-1].args[1].chat_id == 999
+
+
+async def test_sheet_picker_falls_back_when_custom_check_is_unavailable(dialog_bot):
+    from types import SimpleNamespace
+
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    h = dialog_bot
+    h.bot.get_sticker_set = AsyncMock(return_value=SimpleNamespace(stickers=[
+        SimpleNamespace(emoji="✅", custom_emoji_id="12345")
+    ]))
+    attempted = []
+
+    async def send(*args, **kwargs):
+        method = args[1]
+        if isinstance(method, SendMessage) and method.reply_markup:
+            button = method.reply_markup.inline_keyboard[0][0]
+            attempted.append(button.icon_custom_emoji_id)
+            if button.icon_custom_emoji_id:
+                raise TelegramBadRequest(method=method, message="custom icon requires Premium")
+        return AsyncMock()
+
+    h.bot.session.side_effect = send
+    await h.send("/add", 999)
+    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
+    assert attempted == ["12345", None]
+    message = h.bot.session.await_args_list[-1].args[1]
+    assert message.reply_markup.inline_keyboard[0][0].text == "✅ Лист 1"
+
+
+async def test_add_flow_removes_progress_and_selection_messages(dialog_bot):
+    from aiogram.methods import DeleteMessage, SendMessage
+
+    h = dialog_bot
+    next_id = 10
+
+    async def send(bot, method, **kwargs):
+        nonlocal next_id
+        if isinstance(method, SendMessage):
+            next_id += 1
+            return Message(message_id=next_id, date=datetime.now(UTC),
+                           chat=Chat(id=999, type="private"), text=method.text).as_(bot)
+        return True
+
+    h.bot.session.side_effect = send
+    await h.send("/add", 999)
+    await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
+    data = await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data()
+    await h.callback(f"tabs:{data['setup_token']}:next")
+    methods = [call.args[1] for call in h.bot.session.await_args_list]
+    busy_positions = [i for i, method in enumerate(methods)
+                      if isinstance(method, SendMessage) and method.text == "Секундочку"]
+    assert len(busy_positions) == 2
+    for position in busy_positions:
+        assert isinstance(methods[position + 1], DeleteMessage)
+    assert sum(isinstance(method, DeleteMessage) for method in methods) == 3
 
 
 async def test_cancel_and_help_do_not_expose_admin_commands(dialog_bot):
@@ -282,7 +341,7 @@ async def test_dialogs_are_isolated_between_users(dialog_bot):
     await h.send("/start", 123)
     await h.send("/start", 456)
     await h.send("/suggest", 123)
-    assert await h.state(123) == Dialog.title.state
+    assert await h.state(123) == Dialog.link.state
     assert await h.state(456) is None
     assert [row["name"] for row in h.db.all("SELECT name FROM users ORDER BY id")] == [
         "Иванов Иван",
@@ -326,9 +385,9 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
     fetch = AsyncMock(return_value=[["Title"], ["Фамилия", "Имя", "С1"], ["Иванов", "Иван", "5"]])
     monkeypatch.setattr("gradebot.bot.fetch_sheet", fetch)
     await h.send("/add", 999)
-    await h.send("Физика", 999)
-    await h.send("/layout 2 | 1,2", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("/layout 2 | 1,2", 999)
+    await h.send("Физика", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
     await h.send("2 | A:B", 999)
@@ -337,8 +396,8 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
     assert "Ничего не сохранено" in h.replies()[-1]
     await h.send("/cancel", 999)
     await h.send("/add", 999)
-    await h.send("Физика", 999)
     await h.send("https://docs.google.com/spreadsheets/d/physics/edit", 999)
+    await h.send("Физика", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
     await h.send("2 | A:B", 999)
@@ -751,12 +810,12 @@ async def test_duplicate_title_retries_before_asking_for_link(dialog_bot, comman
         "Математический анализ", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "pending"
     )
     await h.send(command, user_id)
+    await h.send("https://docs.google.com/spreadsheets/d/new/edit", user_id)
     await h.send("  математический   АНАЛИЗ  ", user_id)
     assert await h.state(user_id) == Dialog.title.state
     assert "Введи другое название" in h.replies()[-1]
     await h.send("История", user_id)
-    assert await h.state(user_id) == Dialog.link.state
-    assert h.replies()[-1].startswith("Отправь ссылку на таблицу")
+    assert await h.state(user_id) == (Dialog.sheet_selection.state if command == "/add" else None)
 
 
 async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkeypatch):
@@ -765,12 +824,12 @@ async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkey
     h = dialog_bot
     h.db.register(999, "Иванов Иван")
     await h.send("/add", 999)
-    await h.send("История", 999)
+    await h.send("https://docs.google.com/spreadsheets/d/new/edit", 999)
     h.db.add_sheet("История", "https://docs.google.com/spreadsheets/d/other/edit", 1, (1,), 999, "approved")
     monkeypatch.setattr(
         "gradebot.bot.fetch_sheet", AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
     )
-    await h.send("https://docs.google.com/spreadsheets/d/new/edit", 999)
+    await h.send("История", 999)
     assert await h.state(999) == Dialog.title.state
     assert "Введи другое название" in h.replies()[-1]
     assert len(h.db.all("SELECT * FROM sheets")) == 1
@@ -869,8 +928,8 @@ async def test_table_link_acknowledges_before_fetch_and_error(dialog_bot, monkey
 
     monkeypatch.setattr("gradebot.bot.discover_sheets", fetch)
     await h.send("/add", 999)
-    await h.send("История", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("История", 999)
     assert h.replies()[-2] == "Секундочку"
     assert "Не удалось прочитать" in h.replies()[-1]
 
@@ -957,7 +1016,8 @@ async def test_saved_columns_buttons_save_cancel_and_reject_stale_callbacks(dial
     await h.send("1", 999)
     token = (await setup_data(h))["column_token"]
     await h.callback(f"colpick:{token}:3")
-    assert "○ C: Экзамен" in h.replies()[-1]
+    assert "C: Экзамен" in h.replies()[-1]
+    assert "✅ C: Экзамен" not in h.replies()[-1]
     assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] is None
     await h.callback(f"colpick:{token}:done")
     assert json.loads(h.db.all("SELECT parser_options FROM sheets")[0][0])["grade_columns"] == [2]
@@ -1007,8 +1067,8 @@ async def test_setup_column_picker_paging_and_save(dialog_bot, monkeypatch):
     rows = [["ФИО", *[f"С{i}" for i in range(1, 13)]], ["Иванов Иван", *["5"] * 12]]
     monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
     setup_token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{setup_token}:next")
     await h.callback(f"sheetcfg:{setup_token}:0:details")
@@ -1039,11 +1099,15 @@ async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypa
             ["", "№1", "№2", "№1", ""], ["Иванов Иван", "1", "2,5", "3", "4"]]
     monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send(base + "10", 999)
+    await h.send("Матан", 999)
     data = await setup_data(h)
     token = data["setup_token"]
     assert data["selected"] == [0, 1]
+    picker = h.bot.session.await_args.args[1]
+    assert picker.text == "Выбери листы для парсинга"
+    assert picker.reply_markup.inline_keyboard[0][0].text == "✅ Квизы"
+    assert picker.reply_markup.inline_keyboard[-1][0].text == "Далее"
     await h.callback(f"tabs:{token}:all", 123)
     assert (await setup_data(h))["selected"] == [0, 1]
     await h.callback(f"tabs:{token}:all")
@@ -1052,6 +1116,9 @@ async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypa
     assert await h.state(999) == Dialog.sheet_selection.state
     await h.callback(f"tabs:{token}:all")
     await h.callback(f"tabs:{token}:1")
+    picker = h.bot.session.await_args.args[1].reply_markup
+    assert picker.inline_keyboard[0][0].text == "✅ Квизы"
+    assert picker.inline_keyboard[1][0].text == "Семинары"
     await h.callback(f"tabs:{token}:next")
     await h.send("1-2 | A", 999)
     await h.send("только по названию итог", 999)
@@ -1140,8 +1207,8 @@ async def test_workbook_save_rolls_back_every_sheet_on_conflict(dialog_bot, monk
             {"name": "Второй", "url": "https://docs.google.com/spreadsheets/d/book/edit#gid=2"}]
     monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send(tabs[0]["url"], 999)
+    await h.send("Матан", 999)
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
     for _ in tabs:
@@ -1157,18 +1224,26 @@ async def test_workbook_save_rolls_back_every_sheet_on_conflict(dialog_bot, monk
 
 async def test_proposal_picker_selection_survives_until_admin_configuration(dialog_bot, monkeypatch):
     import json
+
+    from aiogram.methods import DeleteMessage
+
     h = dialog_bot
     h.db.register(123, "Иванов Иван")
     tabs = [{"name": "Первый", "url": "https://docs.google.com/spreadsheets/d/book/edit#gid=1"},
             {"name": "Второй", "url": "https://docs.google.com/spreadsheets/d/book/edit#gid=2"}]
     monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
     await h.send("/suggest", 123)
-    await h.send("Матан", 123)
     await h.send(tabs[0]["url"], 123)
+    await h.send("Матан", 123)
     row = h.db.all("SELECT * FROM sheets")[0]
     assert json.loads(row["parser_options"])["selected"] == [0, 1]
     await h.callback(f"ptabs:{row['id']}:0")
+    picker = h.bot.session.await_args.args[1].reply_markup
+    assert picker.inline_keyboard[0][0].text == "Первый"
+    assert picker.inline_keyboard[1][0].text == "✅ Второй"
+    assert picker.inline_keyboard[-1][0].text == "Далее"
     await h.callback(f"configure:{row['id']}")
+    assert any(isinstance(call.args[1], DeleteMessage) for call in h.bot.session.await_args_list)
     data = await setup_data(h)
     assert data["selected"] == [1]
     await h.send("1 | A", 999)
@@ -1180,9 +1255,12 @@ async def test_proposal_picker_selection_survives_until_admin_configuration(dial
 
 
 async def test_compact_auto_setup_buttons_and_stale_sheet_callback(dialog_bot, monkeypatch):
+    from aiogram.methods import DeleteMessage
+
     from gradebot.bot import Dialog
 
     h = dialog_bot
+    h.db.register(999, "Иванов Иван")
     tabs = [{"name": "Семинары", "url": "https://docs.google.com/spreadsheets/d/id/edit#gid=0"},
             {"name": "Квизы", "url": "https://docs.google.com/spreadsheets/d/id/edit#gid=1"}]
     rows = [["№", "ФИО", "03.09.2026", "", "Итоги"],
@@ -1192,40 +1270,51 @@ async def test_compact_auto_setup_buttons_and_stale_sheet_callback(dialog_bot, m
     monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
     monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send(tabs[0]["url"], 999)
+    await h.send("Матан", 999)
     token = (await setup_data(h))["setup_token"]
     h.bot.session.reset_mock()
     await h.callback(f"tabs:{token}:next")
     assert await h.state(999) == Dialog.sheet_columns.state
+    assert any(isinstance(call.args[1], DeleteMessage) for call in h.bot.session.await_args_list)
     replies = [reply for reply in h.replies() if reply]
-    assert len(replies) == 1
-    assert len(replies[0]) < 650
-    assert "ФИО: B · Заголовки: строки 1–3" in replies[0]
-    assert "Боженко" not in replies[0]
-    assert "• 03.09.2026 → Семинар → Отсутствие: 0" in replies[0]
-    assert "• 03.09.2026 → Семинар → Выход к доске: 2" in replies[0]
-    assert "• Итоги → Текущая оценка: 0,0" in replies[0]
+    assert replies[0] == "Секундочку"
+    assert len(replies[-1]) < 650
+    assert "Столбец ФИО: B\nЗаголовки: строки 1–3" in replies[-1]
+    assert "Боженко" not in replies[-1]
+    assert "- 03.09.2026 → Семинар → Отсутствие: 0" in replies[-1]
+    assert "- 03.09.2026 → Семинар → Выход к доске: 2" in replies[-1]
+    assert "- Итоги → Текущая оценка: 0,0" in replies[-1]
     assert (await setup_data(h))["grade_columns"] == (3, 4, 5)
-    await h.callback(f"sheetcfg:{token}:0:totals", 123)
-    assert (await setup_data(h))["grade_columns"] == (3, 4, 5)
-    await h.callback(f"sheetcfg:{token}:0:totals")
-    assert (await setup_data(h))["grade_columns"] == [5]
-    assert "• Итоги → Текущая оценка: 0,0" in h.replies()[-1]
-    assert "Выход к доске" not in h.replies()[-1]
     await h.callback(f"sheetcfg:{token}:0:details")
-    assert any("○ C:" in reply for reply in h.replies() if reply)
+    assert any("C:" in reply for reply in h.replies() if reply)
+    column_token = (await setup_data(h))["column_token"]
+    await h.callback(f"colpick:{column_token}:3")
+    await h.callback(f"colpick:{column_token}:4")
+    await h.callback(f"colpick:{column_token}:done")
+    assert sum(isinstance(call.args[1], DeleteMessage) for call in h.bot.session.await_args_list) >= 3
+    assert (await setup_data(h))["grade_columns"] == [5]
+    assert "- Итоги → Текущая оценка: 0,0" in h.replies()[-1]
+    assert "Выход к доске" not in h.replies()[-1]
     await h.callback(f"sheetcfg:{token}:0:next")
     assert (await setup_data(h))["current_index"] == 1
     await h.callback(f"sheetcfg:{token}:0:skip")
     assert (await setup_data(h))["selected"] == [0, 1]
     await h.callback(f"sheetcfg:{token}:1:layout")
     assert await h.state(999) == Dialog.sheet_layout.state
-    await h.send("1-3 | B", 999)
+    await h.send("1-3\nB", 999)
     await h.callback(f"sheetcfg:{token}:1:next")
     assert await h.state(999) == Dialog.workbook_confirm.state
+    ready = h.bot.session.await_args.args[1]
+    assert ready.text.startswith("Готово к сохранению:")
+    assert "Матан. Семинары:" in ready.text and "Матан. Квизы:" in ready.text
+    assert " · " not in ready.text
+    assert ready.reply_markup.inline_keyboard[0][0].text == "Сохранить"
     await h.callback(f"worksave:{token}")
     assert len(h.db.all("SELECT * FROM sheets WHERE status='approved'")) == 2
+    alerts = h.db.all("SELECT text FROM outbox WHERE kind='table'")
+    assert len(alerts) == 1
+    assert alerts[0]["text"].count("<a href=") == 2
 
 
 async def test_auto_setup_falls_back_to_short_manual_prompt(dialog_bot, monkeypatch):
@@ -1235,21 +1324,23 @@ async def test_auto_setup_falls_back_to_short_manual_prompt(dialog_bot, monkeypa
     rows = [["Студент", "Семинар"], ["Иванов Иван", "5"]]
     monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
     assert await h.state(999) == Dialog.sheet_layout.state
     assert len(h.replies()[-1]) < 600
     assert "Иванов Иван" not in h.replies()[-1]
-    await h.send("1 | A", 999)
+    assert "Для листа «Лист 1» не удалось определить структуру автоматически" in h.replies()[-1]
+    assert "Строка 1:" not in h.replies()[-1]
+    await h.send("1\nA", 999)
     await h.callback(f"sheetcfg:{token}:0:next")
     assert await h.state(999) == Dialog.workbook_confirm.state
 
 
 @pytest.mark.parametrize("student_values,expected", [
-    (["", "0"], ["• С1: пусто", "• С2: 0", "• С3: пусто"]),
-    (["5\n баллов", "x" * 100, "4"], ["• С1: 5 баллов", "• С2: " + "x" * 60 + "…", "• С3: 4"]),
+    (["", "0"], ["- С1: пусто", "- С2: 0", "- С3: пусто"]),
+    (["5\n баллов", "x" * 100, "4"], ["- С1: 5 баллов", "- С2: " + "x" * 60 + "…", "- С3: 4"]),
 ])
 async def test_setup_preview_uses_one_student_row_and_bounds_values(
     dialog_bot, monkeypatch, student_values, expected,
@@ -1259,11 +1350,11 @@ async def test_setup_preview_uses_one_student_row_and_bounds_values(
             ["", "", "служебное значение"], ["Иванов", "Иван", *student_values]]
     monkeypatch.setattr("gradebot.bot.fetch_sheet", AsyncMock(return_value=rows))
     await h.send("/add", 999)
-    await h.send("Матан", 999)
     await h.send("https://docs.google.com/spreadsheets/d/id/edit", 999)
+    await h.send("Матан", 999)
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
-    await h.send("1 | A:B", 999)
+    await h.send("1\nA:B", 999)
     preview = h.replies()[-1]
     assert all(line in preview for line in expected)
     assert "Иванов" not in preview and "служебное значение" not in preview

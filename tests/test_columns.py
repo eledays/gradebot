@@ -116,6 +116,16 @@ def test_column_picker_bounds_html_and_paginates():
     assert len(text) < 3500 and "<b>&lt;&amp;&gt;" in text
     assert len(markup.inline_keyboard) == 11
     buttons = [button for row in markup.inline_keyboard for button in row]
-    assert any(button.callback_data.endswith(":10") and button.text.startswith("✓ J:") for button in buttons)
+    assert any(button.callback_data.endswith(":10") and button.text.startswith("✅ J:") for button in buttons)
+    assert all("○" not in button.text for button in buttons)
     assert any(button.text == "2/3" for button in buttons)
     assert all(len(button.callback_data.encode()) <= 64 for button in buttons)
+
+
+def test_column_picker_uses_custom_check_only_for_selected_columns():
+    data = {"column_title": "Лист", "column_labels": {2: "Квиз", 3: "Экзамен"},
+            "column_selected": [2], "column_token": "a" * 16}
+    _, markup = column_picker(data, check_emoji_id="12345")
+    selected, unselected = markup.inline_keyboard[:2]
+    assert selected[0].icon_custom_emoji_id == "12345" and selected[0].text == "B: Квиз"
+    assert unselected[0].icon_custom_emoji_id is None and unselected[0].text == "C: Экзамен"
