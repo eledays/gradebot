@@ -511,6 +511,35 @@ async def test_addtab_retries_invalid_and_missing_id(dialog_bot):
     assert await h.state(999) == Dialog.addtab_id.state
 
 
+async def test_addtab_lists_workbooks_and_uses_workbook_id_not_sheet_id(dialog_bot, monkeypatch):
+    h = dialog_bot
+    algebra = "https://docs.google.com/spreadsheets/d/algebra/edit#gid="
+    simple = "https://docs.google.com/spreadsheets/d/simple/edit#gid="
+    h.db.add_sheet("Алгебра · Лист1", algebra + "1", 1, (1,), 999, "approved")
+    h.db.add_sheet("Алгебра · Лист3", algebra + "3", 1, (1,), 999, "approved")
+    h.db.add_sheet("Простые оценки", simple + "1", 1, (1,), 999, "approved")
+    workbooks = h.db.extension_workbooks()
+    assert len(workbooks) == 2
+    assert workbooks[0]["id"] != workbooks[1]["id"]
+    assert workbooks[0]["title"] == "Алгебра"
+
+    async def discover(_session, url):
+        assert "simple" in url
+        return [{"name": "Лист1", "url": simple + "1"}, {"name": "Лист2", "url": simple + "2"}]
+
+    monkeypatch.setattr("gradebot.bot.discover_sheets", discover)
+    await h.send("/addtab", 999)
+    preview = h.replies()[-1]
+    assert f"#{workbooks[0]['id']}: Алгебра" in preview
+    assert f"#{workbooks[1]['id']}: Простые оценки" in preview
+    assert "Лист1" not in preview and "Лист3" not in preview
+    await h.send(str(workbooks[1]["id"]), 999)
+    data = await setup_data(h)
+    assert data["title"] == "Простые оценки"
+    assert data["tabs"] == [{"name": "Лист2", "url": simple + "2"}]
+    assert data["extension_source"] == workbooks[1]["id"]
+
+
 @pytest.mark.parametrize("command,user_id", [("/columns", 999), ("/subject", 123)])
 async def test_id_commands_with_no_sheets_do_not_wait_for_input(dialog_bot, command, user_id):
     h = dialog_bot
@@ -596,7 +625,7 @@ async def test_table_groups_use_workbook_identity_and_escape_titles(dialog_bot):
     assert text.count("<b>Алгебра &lt;1&gt;</b>") == 1
     assert ">Семинар &amp; КР</a>" in text and ">Итоги · Модуль 1</a>" in text
     assert ">Алгебра &lt;1&gt; · Экзамен</a>" in text  # Another file remains a single table.
-    assert "<b>Листы одной таблицы</b>" in text
+    assert "<b>Старое название</b>" in text
     assert ">Старое название</a>" in text and ">Отдельное название</a>" in text
 
 
@@ -892,7 +921,7 @@ async def test_subject_grades_pagination_is_owned_and_handles_deleted_sheet(dial
     await h.send("не число", 123)
     assert "числовой ID" in h.replies()[-1]
     await h.send("9999", 123)
-    assert "Таблица больше недоступна" in h.replies()[-1]
+    assert "Лист больше недоступен" in h.replies()[-1]
     await h.send(str(sheet_id), 123)
     assert await h.state(123) is None
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
@@ -919,7 +948,7 @@ async def test_saved_columns_buttons_save_cancel_and_reject_stale_callbacks(dial
     h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved",
                    parsed=Sheet([["ФИО", "Квиз", "Экзамен"], ["Иванов Иван", "4", "5"]]))
     await h.send("Столбцы", 999)
-    assert "Отправь ID таблицы" in h.replies()[-1]
+    assert "Отправь ID листа" in h.replies()[-1]
     await h.send("не число", 999)
     assert "числовой ID" in h.replies()[-1]
     await h.send("9999", 999)
@@ -1073,8 +1102,13 @@ async def test_add_tab_to_existing_workbook_uses_only_new_tabs(dialog_bot, monke
         ("Матан", tabs[0]["url"]), ("Матан · Второй", tabs[1]["url"])
     ]
     assert rows[0]["id"] == original
+    stored = h.db.all("SELECT workbook_id,tab_name FROM sheets ORDER BY id")
+    assert stored[0]["workbook_id"] == stored[1]["workbook_id"]
+    assert [row["tab_name"] for row in stored] == ["Первый", "Второй"]
     assert len(h.db.all("SELECT * FROM sheet_cache")) == 1
     assert json.loads(h.db.all("SELECT tabs FROM workbook_watch")[0][0]) == tabs
+    await h.send("/tables", 999)
+    assert ">Первый</a>" in h.replies()[-1] and ">Второй</a>" in h.replies()[-1]
     await h.send("/addtab", 999)
     await h.send(str(original), 999)
     assert h.replies()[-1] == "Новых листов в этой таблице пока нет"

@@ -10,7 +10,7 @@ from .logging_setup import audit
 from .presentation import bold, create_view, table_link
 from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
-from .structure import group_sheets, header_signature, sheet_group_title, workbook_url
+from .structure import header_signature, sheet_group_title, workbook_url
 
 
 class WorkbookTab(TypedDict):
@@ -24,6 +24,7 @@ class ConfiguredSheet(TypedDict):
     """A validated tab selected for storage."""
 
     title: str
+    tab_name: str
     url: str
     rows: list[list[str]]
     header: int
@@ -38,7 +39,7 @@ class WorkbookDraft(TypedDict):
     configured: list[ConfiguredSheet]
     tabs: list[WorkbookTab]
     title: str
-    url: str
+    url: NotRequired[str]
     proposer: NotRequired[int]
     proposal_id: NotRequired[int]
     extension_source: NotRequired[int]
@@ -296,18 +297,49 @@ class Database:
         key = normalized_title(title)
         return any(normalized_title(row["title"]) == key for row in self.all("SELECT title FROM sheets"))
 
+    def _ensure_workbook(self, title: str, url: str) -> int:
+        """Return the stored parent ID, creating it for a newly seen Google file."""
+        base = workbook_url(url)
+        existing = self.all("SELECT id FROM workbooks WHERE url=?", (base,))
+        if existing:
+            return int(existing[0]["id"])
+        return int(self.conn.execute(
+            "INSERT INTO workbooks(title,url) VALUES(?,?)", (title, base)
+        ).lastrowid)
+
     def add_sheet(self, title: str, url: str, header_row: int, columns: Sequence[int],
-                  proposer: int, status: str, *, parsed: Sheet | None = None, notify: bool = False) -> int:
+                  proposer: int, status: str, *, parsed: Sheet | None = None, notify: bool = False,
+                  workbook_id: int | None = None, tab_name: str | None = None) -> int:
         """Create a sheet and optionally queue a moderation or table message."""
         url = sheet_url(url)
         with nullcontext() if self.conn.in_transaction else self.conn:
             if self.title_exists(title):
                 raise DuplicateTitleError(title)
+            if workbook_id is None:
+                workbook_id = self._ensure_workbook(title, url)
+                group = self.all("SELECT title FROM sheets WHERE workbook_id=?", (workbook_id,))
+                if group:
+                    # Direct additions may arrive one tab at a time without a workbook draft.
+                    shared = sheet_group_title([*group, {"title": title}])
+                    if shared:
+                        self.conn.execute("UPDATE workbooks SET title=? WHERE id=?", (shared, workbook_id))
+                        for previous in group:
+                            self.conn.execute(
+                                "UPDATE sheets SET tab_name=? WHERE workbook_id=? AND title=?",
+                                (str(previous["title"]).removeprefix(shared + " · "), workbook_id,
+                                 previous["title"]),
+                            )
+            workbook = self.all("SELECT title,url FROM workbooks WHERE id=?", (workbook_id,))
+            if not workbook or workbook[0]["url"] != workbook_url(url):
+                raise SheetError("Лист не принадлежит указанной таблице")
+            if tab_name is None:
+                tab_name = title.removeprefix(str(workbook[0]["title"]) + " · ")
             sheet_id = int(self.all("SELECT value FROM settings WHERE key='sheet_sequence'")[0][0]) + 1
             self.conn.execute("UPDATE settings SET value=? WHERE key='sheet_sequence'", (str(sheet_id),))
             self.conn.execute(
-                "INSERT INTO sheets(id,title,url,header_row,name_columns,proposer,status) VALUES(?,?,?,?,?,?,?)",
-                (sheet_id, title, url, header_row, json.dumps(columns), proposer, status),
+                "INSERT INTO sheets(id,title,url,header_row,name_columns,proposer,status,workbook_id,tab_name) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (sheet_id, title, url, header_row, json.dumps(columns), proposer, status, workbook_id, tab_name),
             )
             if parsed is not None:
                 self.conn.execute("UPDATE sheets SET parser_options=? WHERE id=?", (
@@ -401,44 +433,52 @@ class Database:
             )
 
     def remember_workbook(self, url: str, tabs: list[dict[str, str]], *, replace: bool = False) -> None:
-        """Record a workbook and its known tabs."""
+        """Record discovered tabs and refresh stored names of saved sheets."""
+        base = workbook_url(url)
         if replace:
             self.conn.execute("INSERT INTO workbook_watch(url,tabs) VALUES(?,?) "
                               "ON CONFLICT(url) DO UPDATE SET tabs=excluded.tabs",
-                              (workbook_url(url), json.dumps(tabs)))
+                              (base, json.dumps(tabs)))
         else:
             self.conn.execute("INSERT OR IGNORE INTO workbook_watch(url,tabs) VALUES(?,?)",
-                              (workbook_url(url), json.dumps(tabs)))
+                              (base, json.dumps(tabs)))
+        for tab in tabs:
+            self.conn.execute(
+                "UPDATE sheets SET tab_name=? WHERE url=? AND workbook_id IN "
+                "(SELECT id FROM workbooks WHERE url=?)",
+                (tab["name"], sheet_url(tab["url"]), base),
+            )
 
     def extension_workbooks(self) -> list[ExtensionWorkbook]:
-        """List approved workbooks once each for adding new tabs."""
-        return [self._extension_group(group) for group in group_sheets(self.sheets_by_status("approved"))]
+        """List parent workbooks that contain at least one approved tab."""
+        return [self._extension_group(row) for row in self.all(
+            "SELECT w.* FROM workbooks w WHERE EXISTS "
+            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved') ORDER BY w.id"
+        )]
 
-    def extension_source(self, sheet_id: int) -> ExtensionWorkbook | None:
-        """Find the approved workbook containing a stored sheet ID."""
+    def extension_source(self, workbook_id: int) -> ExtensionWorkbook | None:
+        """Find an approved parent workbook by its own ID."""
+        rows = self.all(
+            "SELECT w.* FROM workbooks w WHERE w.id=? AND EXISTS "
+            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved')",
+            (workbook_id,),
+        )
+        return self._extension_group(rows[0]) if rows else None
+
+    def extension_source_for_sheet(self, sheet_id: int) -> ExtensionWorkbook | None:
+        """Resolve a legacy add-tab button that carried a sheet ID."""
         sheet = self.sheet(sheet_id, "approved")
-        if sheet is None:
-            return None
-        group = [row for row in self.sheets_by_status("approved")
-                 if workbook_url(row["url"]) == workbook_url(sheet["url"])]
-        source = self._extension_group(group)
-        source["id"] = sheet_id
-        return source
+        return self.extension_source(int(sheet["workbook_id"])) if sheet else None
 
-    def _extension_group(self, group: list[sqlite3.Row]) -> ExtensionWorkbook:
-        """Build a stable title and URL set for one Google workbook."""
-        first = group[0]
-        title = sheet_group_title(group) or str(first["title"])
-        if len(group) == 1:
-            watch = self.all("SELECT tabs FROM workbook_watch WHERE url=?", (workbook_url(first["url"]),))
-            if watch:
-                for tab in json.loads(watch[0]["tabs"]):
-                    suffix = " · " + tab["name"]
-                    if sheet_url(tab["url"]) == sheet_url(first["url"]) and title.endswith(suffix):
-                        title = title.removesuffix(suffix)
-                        break
-        return {"id": int(first["id"]), "title": title,
-                "url": str(first["url"]), "existing_urls": [sheet_url(row["url"]) for row in group]}
+    def _extension_group(self, workbook: sqlite3.Row) -> ExtensionWorkbook:
+        """Build an extension choice from one persisted parent workbook."""
+        sheets = self.all("SELECT url FROM sheets WHERE workbook_id=? AND status='approved'", (workbook["id"],))
+        return {
+            "id": int(workbook["id"]),
+            "title": str(workbook["title"]),
+            "url": str(workbook["url"]) + "/edit",
+            "existing_urls": [sheet_url(row["url"]) for row in sheets],
+        }
 
     def notification_users(self) -> list[sqlite3.Row]:
         """Activated users with access, including an administrator outside the member list."""
@@ -505,7 +545,8 @@ class Database:
 
     def approved_sheets_with_cache_time(self) -> list[sqlite3.Row]:
         """List approved sheets and their cache timestamps in ID order."""
-        return self.all("SELECT s.*,c.fetched_at FROM sheets s "
+        return self.all("SELECT s.*,w.title AS workbook_title,c.fetched_at FROM sheets s "
+                        "JOIN workbooks w ON w.id=s.workbook_id "
                         "LEFT JOIN sheet_cache c ON c.sheet_id=s.id "
                         "WHERE s.status='approved' ORDER BY s.id")
 
@@ -515,7 +556,18 @@ class Database:
         return str(rows[0]["rows"]) if rows else None
 
     def grade_display_title(self, title: str, url: str) -> str:
-        """Show a workbook title and its tab name without changing stored sheet titles."""
+        """Show the persisted parent title and tab name for grouped sheets."""
+        stored = self.all(
+            "SELECT w.title AS workbook_title,s.tab_name,s.workbook_id FROM sheets s "
+            "JOIN workbooks w ON w.id=s.workbook_id WHERE s.url=?", (sheet_url(url),),
+        )
+        if stored:
+            count = self.all(
+                "SELECT COUNT(*) AS n FROM sheets WHERE workbook_id=? AND status='approved'",
+                (stored[0]["workbook_id"],),
+            )[0]["n"]
+            if count > 1:
+                return f"{stored[0]['workbook_title']}. {stored[0]['tab_name']}"
         if " · " in title:
             return title.replace(" · ", ". ")
         watched = self.all("SELECT tabs FROM workbook_watch WHERE url=?", (workbook_url(url),))
@@ -526,7 +578,9 @@ class Database:
             return title
         for tab in tabs:
             if sheet_url(tab["url"]) == sheet_url(url):
-                return f"{title}. {tab['name']}"
+                prefix = stored[0]["workbook_title"] if stored else title
+                name = stored[0]["tab_name"] if stored else tab["name"]
+                return f"{prefix}. {name}"
         return title
 
     def view(self, view_id: str) -> sqlite3.Row | None:
@@ -588,6 +642,13 @@ class Database:
                     raise SheetError("Исходная таблица больше недоступна")
                 if any(sheet_url(item["url"]) in source["existing_urls"] for item in data["configured"]):
                     raise SheetError("Один из листов уже добавлен")
+                workbook_id = source["id"]
+                self.conn.execute("UPDATE workbooks SET title=? WHERE id=?", (data["title"], workbook_id))
+            else:
+                workbook_url_input = data.get("url") or data.get("all_tabs", data["tabs"])[0]["url"]
+                workbook_id = self._ensure_workbook(data["title"], workbook_url_input)
+                if not self.all("SELECT 1 FROM sheets WHERE workbook_id=? AND status='approved'", (workbook_id,)):
+                    self.conn.execute("UPDATE workbooks SET title=? WHERE id=?", (data["title"], workbook_id))
             if proposal:
                 if self.sheet(int(proposal), "pending") is None:
                     raise SheetError("Предложение уже обработано")
@@ -597,7 +658,8 @@ class Database:
                 parsed = Sheet(item["rows"], item["header"], tuple(item["columns"]),
                                item["header_start"], tuple(item["grade_columns"]))
                 self.add_sheet(item["title"], item["url"], item["header"], item["columns"],
-                               data.get("proposer", admin_id), "approved", parsed=parsed)
+                               data.get("proposer", admin_id), "approved", parsed=parsed,
+                               workbook_id=workbook_id, tab_name=item["tab_name"])
             all_tabs = data.get("all_tabs", data["tabs"])
             self.remember_workbook(all_tabs[0]["url"], all_tabs, replace=bool(extension))
             for item in configured:

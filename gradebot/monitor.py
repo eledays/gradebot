@@ -38,6 +38,7 @@ class GradeReport(CacheState):
     """Cached grades and lookup status for one user and sheet."""
 
     sheet_id: int
+    workbook_id: int
     title: str
     url: str
     status: str
@@ -151,6 +152,7 @@ class Monitor:
             reports.append(
                 {
                     "sheet_id": sheet["id"],
+                    "workbook_id": sheet["workbook_id"],
                     "title": self.db.grade_display_title(sheet["title"], sheet["url"]),
                     "url": sheet["url"],
                     "status": status,
@@ -277,10 +279,7 @@ class Monitor:
                                           messages.render("structure.new_tabs")],
                                           kind="structure", admin=True)
                             structure_notifications += 1
-                    self.db.conn.execute(
-                        "INSERT INTO workbook_watch VALUES(?,?) ON CONFLICT(url) DO UPDATE SET tabs=excluded.tabs",
-                        (url, json.dumps(tabs)),
-                    )
+                    self.db.remember_workbook(url, tabs, replace=True)
                 for sheet_id, rows, invalid in structures:
                     if sheet_id in active:
                         structure_notifications += self.record_structure(active[sheet_id], rows, invalid)

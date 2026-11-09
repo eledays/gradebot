@@ -19,10 +19,12 @@ def workbook_url(url: str) -> str:
 
 
 def group_sheets(sheets: Sequence[RowT]) -> list[list[RowT]]:
-    """Group sheets by their Google workbook."""
+    """Group sheets by stored parent, falling back to URL for legacy rows."""
     groups = {}
     for sheet in sheets:
-        groups.setdefault(workbook_url(sheet["url"]), []).append(sheet)
+        workbook_id = sheet["workbook_id"] if "workbook_id" in sheet.keys() else None
+        key = ("id", workbook_id) if workbook_id is not None else ("url", workbook_url(sheet["url"]))
+        groups.setdefault(key, []).append(sheet)
     return list(groups.values())
 
 

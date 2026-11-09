@@ -226,7 +226,7 @@ async def test_admin_can_delete_table_by_id_with_confirmation(app):
     sheet_id = app.db.add_sheet(
         "Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved"
     )
-    await app.send("Удалить таблицу")
+    await app.send("Удалить лист")
     method = app.bot.session.await_args.args[1]
     assert f"#{sheet_id}: Матан" in method.text
     assert method.reply_markup is None
@@ -235,7 +235,7 @@ async def test_admin_can_delete_table_by_id_with_confirmation(app):
     data = await app.context().get_data()
     await app.click(f"remove:{data['token']}")
     assert not app.db.all("SELECT * FROM sheets")
-    await app.send("Удалить таблицу")
+    await app.send("Удалить лист")
     assert app.replies()[-1] == "Таблиц пока нет"
 
 

@@ -30,7 +30,8 @@ def test_legacy_users_and_snapshots_get_local_ids(tmp_path):
             (1, 123), (2, 456)
         ]
         assert db.all("SELECT user_id,grades FROM snapshots")[0]["user_id"] == 2
-        assert db.all("PRAGMA user_version")[0][0] == 1
+        assert db.all("PRAGMA user_version")[0][0] == 2
+        assert db.all("SELECT workbook_id FROM sheets")[0][0] == db.all("SELECT id FROM workbooks")[0][0]
         assert db.all("PRAGMA foreign_key_check") == []
     finally:
         db.close()
@@ -39,6 +40,41 @@ def test_legacy_users_and_snapshots_get_local_ids(tmp_path):
         assert reopened.all("SELECT user_id FROM snapshots")[0][0] == 2
     finally:
         reopened.close()
+
+
+def test_v1_workbook_migration_groups_tabs_without_changing_sheet_ids(tmp_path):
+    path = tmp_path / "v1.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            PRAGMA user_version=1;
+            CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL UNIQUE,
+                name TEXT NOT NULL, notifications INTEGER NOT NULL DEFAULT 1);
+            CREATE TABLE sheets(id INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
+                header_row INTEGER NOT NULL, name_columns TEXT NOT NULL, proposer INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', parser_options TEXT NOT NULL DEFAULT '{}');
+            INSERT INTO sheets(id,title,url,header_row,name_columns,proposer,status) VALUES
+                (7,'Алгебра · Лист1','https://docs.google.com/spreadsheets/d/algebra/edit#gid=1',1,'[1]',999,'approved'),
+                (8,'Алгебра · Лист3','https://docs.google.com/spreadsheets/d/algebra/edit#gid=3',1,'[1]',999,'approved'),
+                (9,'Простые оценки','https://docs.google.com/spreadsheets/d/simple/edit',1,'[1]',999,'approved');
+        """)
+    db = Database(str(path))
+    try:
+        assert db.all("PRAGMA user_version")[0][0] == 2
+        workbooks = db.all("SELECT id,title,url FROM workbooks ORDER BY id")
+        assert [(row["title"], row["url"]) for row in workbooks] == [
+            ("Алгебра", "https://docs.google.com/spreadsheets/d/algebra"),
+            ("Простые оценки", "https://docs.google.com/spreadsheets/d/simple"),
+        ]
+        assert [(row["id"], row["workbook_id"], row["tab_name"]) for row in db.all(
+            "SELECT id,workbook_id,tab_name FROM sheets ORDER BY id"
+        )] == [
+            (7, workbooks[0]["id"], "Лист1"),
+            (8, workbooks[0]["id"], "Лист3"),
+            (9, workbooks[1]["id"], "Простые оценки"),
+        ]
+        assert db.all("PRAGMA foreign_key_check") == []
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("mode", ["erase", "block"])
@@ -61,8 +97,7 @@ def test_cli_user_removal_requires_confirmation_and_cleans_references(
         db.execute("INSERT INTO outbox(user_id,text) VALUES(123,'queued')")
         db.execute("INSERT INTO outbox(user_id,text,view_id,kind) "
                    "VALUES(999,'<i>От пользователя 123</i>','proposal','proposal')")
-        db.execute("INSERT INTO sheets(title,url,header_row,name_columns,proposer) "
-                   "VALUES('Test','https://docs.google.com/spreadsheets/d/test/edit',1,'[0]',123)")
+        db.add_sheet("Test", "https://docs.google.com/spreadsheets/d/test/edit", 1, (0,), 123, "pending")
         db.snapshot(123, 1, {"A": "5"}, [])
     finally:
         db.close()

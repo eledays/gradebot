@@ -1,11 +1,13 @@
 """SQLite schema creation and additive migrations."""
 
+import json
 import re
 import sqlite3
 
 from .sheets import sheet_url
+from .structure import sheet_group_title, workbook_url
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def initialize_database(conn: sqlite3.Connection) -> None:
@@ -68,8 +70,22 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sheets ADD COLUMN parser_options TEXT NOT NULL DEFAULT '{}'")
     if version == 0:
         _migrate_users(conn)
+    if version < 2:
+        _migrate_workbooks(conn)
     # Migrate CSV URLs without producing duplicate logical sheets.
     with conn:
+        conn.execute("CREATE INDEX IF NOT EXISTS sheets_workbook_status ON sheets(workbook_id,status)")
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS sheets_require_parent_insert BEFORE INSERT ON sheets "
+            "WHEN NEW.workbook_id IS NULL OR NEW.tab_name='' BEGIN "
+            "SELECT RAISE(ABORT,'sheet requires a workbook and tab name'); END"
+        )
+        conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS sheets_require_parent_update "
+            "BEFORE UPDATE OF workbook_id,tab_name ON sheets "
+            "WHEN NEW.workbook_id IS NULL OR NEW.tab_name='' BEGIN "
+            "SELECT RAISE(ABORT,'sheet requires a workbook and tab name'); END"
+        )
         # Never reuse IDs referenced by old Telegram moderation buttons.
         maximum = conn.execute("SELECT COALESCE(MAX(id),0) AS n FROM sheets").fetchone()["n"]
         for view in conn.execute("SELECT actions FROM views"):
@@ -110,4 +126,41 @@ def _migrate_users(conn: sqlite3.Connection) -> None:
         conn.execute("DROP TABLE users")
         conn.execute("ALTER TABLE users_new RENAME TO users")
         conn.execute("ALTER TABLE snapshots_new RENAME TO snapshots")
-        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        conn.execute("PRAGMA user_version=1")
+
+
+def _migrate_workbooks(conn: sqlite3.Connection) -> None:
+    """Persist one parent workbook for every existing group of tabs."""
+    with conn:
+        conn.execute(
+            "CREATE TABLE workbooks(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "title TEXT NOT NULL, url TEXT NOT NULL UNIQUE)"
+        )
+        conn.execute("ALTER TABLE sheets ADD COLUMN workbook_id INTEGER REFERENCES workbooks(id)")
+        conn.execute("ALTER TABLE sheets ADD COLUMN tab_name TEXT NOT NULL DEFAULT ''")
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in conn.execute("SELECT id,title,url FROM sheets ORDER BY id"):
+            groups.setdefault(workbook_url(row["url"]), []).append(row)
+        for url, sheets in groups.items():
+            title = sheet_group_title(sheets) or str(sheets[0]["title"])
+            watched = conn.execute("SELECT tabs FROM workbook_watch WHERE url=?", (url,)).fetchone()
+            known_tabs = {
+                sheet_url(tab["url"]): tab["name"]
+                for tab in json.loads(watched["tabs"])
+            } if watched else {}
+            if len(sheets) == 1:
+                tab_name = known_tabs.get(sheet_url(sheets[0]["url"]))
+                if tab_name and title.endswith(" · " + tab_name):
+                    title = title.removesuffix(" · " + tab_name)
+            workbook_id = conn.execute(
+                "INSERT INTO workbooks(title,url) VALUES(?,?)", (title, url)
+            ).lastrowid
+            conn.executemany(
+                "UPDATE sheets SET workbook_id=?,tab_name=? WHERE id=?",
+                [(
+                    workbook_id,
+                    known_tabs.get(sheet_url(sheet["url"]), str(sheet["title"]).removeprefix(title + " · ")),
+                    sheet["id"],
+                ) for sheet in sheets],
+            )
+        conn.execute("PRAGMA user_version=2")
