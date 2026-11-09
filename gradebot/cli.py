@@ -21,7 +21,7 @@ def main():
 def _main():
     load_dotenv(Path.cwd() / ".env", override=False)
     parser = argparse.ArgumentParser(description="Telegram grade bot for one university group")
-    parser.add_argument("--db", default=os.getenv("DATABASE_PATH", "grades.sqlite3"))
+    parser.add_argument("--db", default=os.getenv("DATABASE_PATH", "instance/grades.sqlite3"))
     commands = parser.add_subparsers(dest="command", required=True)
     admin = commands.add_parser("admin", help="Set the single administrator Telegram ID")
     admin.add_argument("telegram_id", type=int)

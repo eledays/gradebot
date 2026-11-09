@@ -15,6 +15,9 @@ dev = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "ruff>=0.9,<1"]
 [project.scripts]
 gradebot = "gradebot.cli:main"
 
+[tool.setuptools.package-data]
+gradebot = ["messages.toml"]
+
 [tool.setuptools.packages.find]
 include = ["gradebot*"]
 
