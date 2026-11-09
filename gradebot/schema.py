@@ -5,9 +5,14 @@ import sqlite3
 
 from .sheets import sheet_url
 
+SCHEMA_VERSION = 1
+
 
 def initialize_database(conn: sqlite3.Connection) -> None:
-    """Create schema and migrate older databases without changing stored grades."""
+    """Create the legacy baseline and apply numbered, transactional migrations."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise RuntimeError("Database schema is newer than this version of gradebot")
     conn.executescript("""
     PRAGMA foreign_keys=ON;
     PRAGMA journal_mode=WAL;
@@ -61,6 +66,8 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE views ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
     if "parser_options" not in {row["name"] for row in conn.execute("PRAGMA table_info(sheets)")}:
         conn.execute("ALTER TABLE sheets ADD COLUMN parser_options TEXT NOT NULL DEFAULT '{}'")
+    if version == 0:
+        _migrate_users(conn)
     # Migrate CSV URLs without producing duplicate logical sheets.
     with conn:
         # Never reuse IDs referenced by old Telegram moderation buttons.
@@ -75,3 +82,32 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         )
         for row in conn.execute("SELECT id,url FROM sheets"):
             conn.execute("UPDATE sheets SET url=? WHERE id=?", (sheet_url(row["url"]), row["id"]))
+
+
+def _migrate_users(conn: sqlite3.Connection) -> None:
+    """Replace Telegram-keyed users with local IDs and remap grade snapshots."""
+    with conn:
+        conn.execute(
+            "CREATE TABLE users_new(id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "telegram_id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL, "
+            "notifications INTEGER NOT NULL DEFAULT 1)"
+        )
+        conn.execute(
+            "INSERT INTO users_new(telegram_id,name,notifications) "
+            "SELECT id,name,notifications FROM users ORDER BY id"
+        )
+        conn.execute(
+            "CREATE TABLE snapshots_new(user_id INTEGER REFERENCES users_new(id) ON DELETE CASCADE, "
+            "sheet_id INTEGER REFERENCES sheets(id) ON DELETE CASCADE, "
+            "grades TEXT NOT NULL, PRIMARY KEY(user_id,sheet_id))"
+        )
+        conn.execute(
+            "INSERT INTO snapshots_new(user_id,sheet_id,grades) "
+            "SELECT u.id,s.sheet_id,s.grades FROM snapshots s "
+            "JOIN users_new u ON u.telegram_id=s.user_id"
+        )
+        conn.execute("DROP TABLE snapshots")
+        conn.execute("DROP TABLE users")
+        conn.execute("ALTER TABLE users_new RENAME TO users")
+        conn.execute("ALTER TABLE snapshots_new RENAME TO snapshots")
+        conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")

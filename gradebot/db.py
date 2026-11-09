@@ -54,7 +54,7 @@ def normalized_title(title: str) -> str:
 
 class Database:
     def __init__(self, path: str) -> None:
-        """Open the database and apply additive schema migrations."""
+        """Open the database and apply schema migrations."""
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
@@ -81,7 +81,9 @@ class Database:
 
     def authorized(self, user_id: int) -> bool:
         """Check whether a user may interact with the bot."""
-        return user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
+        return not self.blocked(user_id) and (
+            user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
+        )
 
     def blocked(self, user_id: int) -> bool:
         """Check whether a user is denied access."""
@@ -159,7 +161,7 @@ class Database:
                     "DO UPDATE SET name=excluded.name,username=excluded.username",
                     (user_id, name, username),
                 )
-                if self.all("SELECT id FROM users WHERE id=?", (user_id,)):
+                if self.all("SELECT id FROM users WHERE telegram_id=?", (user_id,)):
                     self._save_name(user_id, name)
         if count:
             audit("members_granted", count=count)
@@ -175,13 +177,15 @@ class Database:
 
     def _save_name(self, user_id: int, name: str) -> None:
         """Upsert an active name and invalidate stale grade state."""
-        old = self.conn.execute("SELECT name FROM users WHERE id=?", (user_id,)).fetchone()
+        old = self.conn.execute("SELECT name FROM users WHERE telegram_id=?", (user_id,)).fetchone()
         self.conn.execute(
-            "INSERT INTO users(id,name) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            "INSERT INTO users(telegram_id,name) VALUES(?,?) "
+            "ON CONFLICT(telegram_id) DO UPDATE SET name=excluded.name",
             (user_id, name),
         )
         if old and old[0] != name:
-            self.conn.execute("DELETE FROM snapshots WHERE user_id=?", (user_id,))
+            self.conn.execute("DELETE FROM snapshots WHERE user_id="
+                              "(SELECT id FROM users WHERE telegram_id=?)", (user_id,))
             self.conn.execute(
                 "DELETE FROM views WHERE owner=? AND admin=0 AND id NOT IN "
                 "(SELECT view_id FROM outbox WHERE user_id=? AND status='pending' "
@@ -196,17 +200,67 @@ class Database:
         """Remove a member, their active state, and queued messages."""
         with self.conn:
             result = self.conn.execute("DELETE FROM members WHERE id=?", (user_id,))
-            self.conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+            self.conn.execute("DELETE FROM users WHERE telegram_id=?", (user_id,))
             self.conn.execute("DELETE FROM views WHERE owner=?", (user_id,))
             self.conn.execute("DELETE FROM outbox WHERE user_id=?", (user_id,))
         audit("member_revoked", count=int(bool(result.rowcount)))
         return bool(result.rowcount)
 
+    def user_for_removal(self, local_id: int) -> sqlite3.Row | None:
+        """Find an active user by local ID without exposing private data."""
+        row = self.conn.execute(
+            "SELECT id,telegram_id FROM users WHERE id=?", (local_id,)
+        ).fetchone()
+        return row
+
+    def user_ids(self) -> list[sqlite3.Row]:
+        """List local and Telegram IDs for CLI administration."""
+        return self.all("SELECT id,telegram_id FROM users ORDER BY id")
+
+    def remove_user(self, local_id: int, *, block: bool) -> bool:
+        """Erase a user and related records, optionally barring another registration."""
+        with self.conn:
+            user = self.user_for_removal(local_id)
+            if user is None or user["telegram_id"] == self.admin_id():
+                return False
+            telegram_id = int(user["telegram_id"])
+            # A queued proposal embeds the proposer ID in rendered HTML; remove its view too.
+            proposal_views = self.conn.execute(
+                "SELECT view_id FROM outbox WHERE kind='proposal' AND "
+                "instr(text, '<i>От пользователя ' || ? || '</i>')>0",
+                (telegram_id,),
+            ).fetchall()
+            self.conn.execute(
+                "DELETE FROM outbox WHERE kind='proposal' AND "
+                "instr(text, '<i>От пользователя ' || ? || '</i>')>0",
+                (telegram_id,),
+            )
+            for row in proposal_views:
+                if row["view_id"] is not None:
+                    self.conn.execute("DELETE FROM views WHERE id=?", (row["view_id"],))
+            self.conn.execute(
+                "DELETE FROM views WHERE owner=? AND admin=1 AND instr(pages, 'ID ' || ?)>0",
+                (self.admin_id(), telegram_id),
+            )
+            self.conn.execute("UPDATE sheets SET proposer=0 WHERE proposer=?", (telegram_id,))
+            self.conn.execute("DELETE FROM members WHERE id=?", (telegram_id,))
+            self.conn.execute("DELETE FROM name_requests WHERE user_id=?", (telegram_id,))
+            self.conn.execute("DELETE FROM registration_drafts WHERE user_id=?", (telegram_id,))
+            self.conn.execute("DELETE FROM views WHERE owner=?", (telegram_id,))
+            self.conn.execute("DELETE FROM outbox WHERE user_id=?", (telegram_id,))
+            self.conn.execute("DELETE FROM users WHERE id=?", (local_id,))
+            if block:
+                self.conn.execute("INSERT OR IGNORE INTO blocked_users(id) VALUES(?)", (telegram_id,))
+            else:
+                self.conn.execute("DELETE FROM blocked_users WHERE id=?", (telegram_id,))
+        audit("user_removed")
+        return True
+
     def toggle_notifications(self, user_id: int) -> bool:
         """Toggle grade notifications and discard queued grades when disabled."""
         with self.conn:
-            self.conn.execute("UPDATE users SET notifications=1-notifications WHERE id=?", (user_id,))
-            enabled = self.all("SELECT notifications FROM users WHERE id=?", (user_id,))[0][0]
+            self.conn.execute("UPDATE users SET notifications=1-notifications WHERE telegram_id=?", (user_id,))
+            enabled = self.all("SELECT notifications FROM users WHERE telegram_id=?", (user_id,))[0][0]
             if not enabled:
                 self.conn.execute(
                     "DELETE FROM outbox WHERE user_id=? AND kind='grades' AND status='pending'", (user_id,)
@@ -307,7 +361,8 @@ class Database:
         """Persist grades and queue detected changes."""
         with self.conn:
             self.conn.execute(
-                "INSERT INTO snapshots VALUES(?,?,?) ON CONFLICT(user_id,sheet_id) "
+                "INSERT INTO snapshots(user_id,sheet_id,grades) "
+                "VALUES((SELECT id FROM users WHERE telegram_id=?),?,?) ON CONFLICT(user_id,sheet_id) "
                 "DO UPDATE SET grades=excluded.grades",
                 (user_id, sheet_id, json.dumps(grades)),
             )
@@ -344,8 +399,9 @@ class Database:
     def notification_users(self) -> list[sqlite3.Row]:
         """Activated users with access, including an administrator outside the member list."""
         return self.all(
-            "SELECT u.* FROM users u WHERE u.id=? "
-            "OR EXISTS (SELECT 1 FROM members m WHERE m.id=u.id)",
+            "SELECT u.* FROM users u WHERE (u.telegram_id=? "
+            "OR EXISTS (SELECT 1 FROM members m WHERE m.id=u.telegram_id)) "
+            "AND NOT EXISTS (SELECT 1 FROM blocked_users b WHERE b.id=u.telegram_id)",
             (self.admin_id(),),
         )
 
@@ -353,7 +409,7 @@ class Database:
         """Queue a new-table announcement for active users."""
         for user in self.notification_users():
             self.queue(
-                user["id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
+                user["telegram_id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
             )
 
     def has_join_draft(self, user_id: int) -> bool:
@@ -371,7 +427,7 @@ class Database:
 
     def user_name(self, user_id: int) -> str | None:
         """Return an activated user's name, if present."""
-        rows = self.all("SELECT name FROM users WHERE id=?", (user_id,))
+        rows = self.all("SELECT name FROM users WHERE telegram_id=?", (user_id,))
         return str(rows[0]["name"]) if rows else None
 
     def member_name(self, user_id: int) -> str | None:
@@ -422,7 +478,7 @@ class Database:
     def member_rows(self) -> list[sqlite3.Row]:
         """List members with activation state for the admin screen."""
         return self.all("SELECT m.*,u.id AS active FROM members m "
-                        "LEFT JOIN users u ON u.id=m.id ORDER BY m.name")
+                        "LEFT JOIN users u ON u.telegram_id=m.id ORDER BY m.name")
 
     def has_other_members(self) -> bool:
         """Return whether any non-admin members can be revoked."""

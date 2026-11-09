@@ -10,9 +10,9 @@ def test_invitation_expiry_registration_and_block(tmp_path):
         assert db.begin_join(123, token)
         assert db.join(123, 'ivanov', 'Иванов Иван', token)
         assert db.authorized(123)
-        assert db.all('SELECT name FROM users WHERE id=123')[0]['name'] == 'Иванов Иван'
+        assert db.all('SELECT name FROM users WHERE telegram_id=123')[0]['name'] == 'Иванов Иван'
         assert db.change_name(123, 'Петров Петр')
-        assert db.all('SELECT name FROM users WHERE id=123')[0]['name'] == 'Петров Петр'
+        assert db.all('SELECT name FROM users WHERE telegram_id=123')[0]['name'] == 'Петров Петр'
         assert db.block(123)
         assert not db.authorized(123)
         assert not db.begin_join(123, token)

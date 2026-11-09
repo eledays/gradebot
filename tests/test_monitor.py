@@ -286,7 +286,7 @@ async def test_admin_without_member_entry_receives_grade_changes(db):
     monitor.fetch = AsyncMock(return_value=parsed("4"))
     first = await monitor.scan()
     assert first["notifications"] == 1
-    assert json.loads(db.all("SELECT grades FROM snapshots WHERE user_id=123")[0]["grades"]) == {"С1": "4"}
+    assert json.loads(db.all("SELECT grades FROM snapshots")[0]["grades"]) == {"С1": "4"}
     monitor.bot.send_message.reset_mock()
     unchanged = await monitor.scan()
     assert unchanged["notifications"] == 0

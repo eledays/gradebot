@@ -133,7 +133,7 @@ class Monitor:
 
     async def inspect_user(self, user_id: int, *, baseline: bool = False) -> list[GradeReport]:
         """Read persisted cache only; never wait for Google or mutate it on /grades."""
-        user = self.db.all("SELECT * FROM users WHERE id=?", (user_id,))[0]
+        user = self.db.all("SELECT * FROM users WHERE telegram_id=?", (user_id,))[0]
         reports = []
         for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
             cache = self.db.all("SELECT * FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
@@ -336,7 +336,7 @@ class Monitor:
                                 lines.extend(safe_lines(f"- {column}: {value}"))
                             lines.append("")
                     if len(lines) > 2 and user["notifications"]:
-                        self.db.queue(user["id"], lines)
+                        self.db.queue(user["telegram_id"], lines)
                         notifications += 1
         await self.deliver()
         return {"updated": len(fetched), "failed": failed, "notifications": notifications,

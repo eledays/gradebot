@@ -37,6 +37,7 @@ EVENTS = frozenset(
         "moderation_failed",
         "members_granted",
         "member_revoked",
+        "user_removed",
     }
 )
 NUMBERS = frozenset(
