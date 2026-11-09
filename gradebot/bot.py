@@ -28,7 +28,7 @@ from aiogram.types import (
 )
 
 from .columns import PAGE_SIZE, ColumnPickerData, column_picker
-from .db import Database, DuplicateTitleError, WorkbookDraft
+from .db import Database, DuplicateTitleError, ExtensionWorkbook, WorkbookDraft
 from .logging_setup import audit
 from .messages import TrustedHtml, messages
 from .monitor import GradeReport, Monitor, cache_caption, format_grades, subject_pages
@@ -96,6 +96,7 @@ class Dialog(StatesGroup):
     edit_columns = State()
     columns_id = State()
     subject_id = State()
+    addtab_id = State()
     remove = State()
 
 
@@ -225,6 +226,13 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
     def registered(user_id: int) -> bool:
         """Check whether a user has an active profile."""
         return db.user_name(user_id) is not None
+
+    async def show_sheet_id_prompt(message: Message, prompt_key: str, rows: Sequence[sqlite3.Row]) -> None:
+        """Show a compact, paginated list of approved sheet IDs."""
+        lines = [messages.render(prompt_key), ""]
+        for row in rows:
+            lines.extend(safe_lines(f"#{row['id']}: {db.grade_display_title(row['title'], row['url'])}"))
+        await send_view(message, db, lines)
 
     @router.message(F.chat.type != "private")
     async def private_only(message: Message) -> None:
@@ -423,11 +431,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await message.answer(messages.render("replies.subject_command_1"))
             return
         await state.clear()
-        if not db.sheets_by_status("approved"):
+        rows = db.sheets_by_status("approved")
+        if not rows:
             await message.answer(messages.render("replies.subject_command_2"))
             return
         await state.set_state(Dialog.subject_id)
-        await message.answer(messages.render("replies.subject_command_3"))
+        await show_sheet_id_prompt(message, "replies.subject_command_3", rows)
 
     @router.message(Dialog.subject_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
     async def subject_id(message: Message, state: FSMContext) -> None:
@@ -512,11 +521,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await message.answer(messages.render("replies.columns_command_1"))
             return
         await state.clear()
-        if not db.sheets_by_status("approved"):
+        rows = db.sheets_by_status("approved")
+        if not rows:
             await message.answer(messages.render("replies.columns_command_2"))
             return
         await state.set_state(Dialog.columns_id)
-        await message.answer(messages.render("replies.columns_command_3"))
+        await show_sheet_id_prompt(message, "replies.columns_command_3", rows)
 
     @router.message(Dialog.columns_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
     async def columns_id(message: Message, state: FSMContext) -> None:
@@ -666,21 +676,47 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
     @router.message(F.text == "Добавить лист")
     @router.message(Command("addtab"))
     async def add_tab(message: Message, state: FSMContext) -> None:
-        """Offer existing Google workbooks for adding newly discovered tabs."""
+        """Ask for a sheet ID to add new tabs to its workbook."""
         if message.from_user.id != db.admin_id():
             await message.answer(messages.render("replies.add_1"))
             return
         await state.clear()
-        workbooks = db.extension_workbooks()
-        if not workbooks:
+        rows = db.sheets_by_status("approved")
+        if not rows:
             await message.answer(messages.render("replies.add_tab_empty"))
             return
-        lines, actions = [bold("Выбери существующую таблицу"), ""], {}
-        for workbook in workbooks:
-            anchor = f"#{workbook['id']}:"
-            lines.append(f"{anchor} {table_link(workbook['title'], workbook['url'])}")
-            actions[anchor] = [("Добавить лист", f"extend:{workbook['id']}")]
-        await send_view(message, db, lines, admin=True, actions=actions)
+        await state.set_state(Dialog.addtab_id)
+        await show_sheet_id_prompt(message, "replies.add_tab_prompt", rows)
+
+    @router.message(Dialog.addtab_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
+    async def add_tab_id(message: Message, state: FSMContext) -> None:
+        """Load the workbook identified by an approved sheet ID."""
+        if message.from_user.id != db.admin_id():
+            await state.clear()
+            await message.answer(messages.render("replies.add_1"))
+            return
+        try:
+            sheet_id = int(message.text.strip())
+            if not 0 < sheet_id < 2**63:
+                raise ValueError
+        except ValueError:
+            await message.answer(messages.render("replies.add_tab_id_invalid"))
+            return
+        source = db.extension_source(sheet_id)
+        if source is None:
+            await message.answer(messages.render("replies.add_tab_id_missing"))
+            return
+        await begin_extension(message, state, source)
+
+    async def begin_extension(message: Message, state: FSMContext, source: ExtensionWorkbook) -> None:
+        """Start discovering tabs of an existing approved workbook."""
+        await state.clear()
+        await state.update_data(title=source["title"], direct=True, extension_source=source["id"])
+        try:
+            await begin_workbook(message, state, source["url"], existing_urls=set(source["existing_urls"]))
+        except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
+            await state.clear()
+            await message.answer(messages.render("replies.add_tab_failed", reason=str(exc)))
 
     @router.callback_query(F.data.regexp(r"^extend:\d+$"))
     async def extend_workbook(callback: CallbackQuery, state: FSMContext) -> None:
@@ -695,14 +731,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await callback.answer()
         if not isinstance(callback.message, Message):
             return
-        await state.clear()
-        await state.update_data(title=source["title"], direct=True, extension_source=source["id"])
-        try:
-            await begin_workbook(callback.message, state, source["url"],
-                                 existing_urls=set(source["existing_urls"]))
-        except (SheetError, aiohttp.ClientError, UnicodeError, TimeoutError) as exc:
-            await state.clear()
-            await callback.message.answer(messages.render("replies.add_tab_failed", reason=str(exc)))
+        await begin_extension(callback.message, state, source)
 
     @router.message(Command("layout"))
     async def layout(message: Message, state: FSMContext) -> None:
@@ -872,16 +901,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await message.answer(messages.render("replies.remove_1"))
             return
         await state.clear()
-        await state.set_state(Dialog.remove)
         rows = db.sheets_by_status("approved")
-        lines, actions = [bold("Выбери таблицу для удаления"), ""], {}
-        for row in rows:
-            anchor = f"#{row['id']}:"
-            lines.append(f"{anchor} {table_link(row['title'], row['url'])}")
-            actions[anchor] = [(f"Удалить #{row['id']}", f"pick_remove:{row['id']}")]
         if not rows:
-            await state.clear()
-        await send_view(message, db, lines if rows else ["Таблиц пока нет"], admin=True, actions=actions)
+            await message.answer(messages.render("replies.columns_command_2"))
+            return
+        await state.set_state(Dialog.remove)
+        await show_sheet_id_prompt(message, "replies.remove_prompt", rows)
 
     @router.message(F.text == "Пользователи")
     @router.message(Command("members"))
@@ -1557,6 +1582,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         try:
             sheet_id = int(message.text.strip())
+            if not 0 < sheet_id < 2**63:
+                raise ValueError
         except ValueError:
             await message.answer(messages.render("replies.remove_id_2"))
             return
@@ -1600,6 +1627,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             Dialog.title.state: "Жду название предмета",
             Dialog.link.state: "Жду ссылку на таблицу",
             Dialog.remove.state: "Жду номер таблицы",
+            Dialog.addtab_id.state: messages.render("replies.add_tab_id_waiting"),
             Dialog.requested_name.state: "Введи новое ФИО",
             Dialog.remove_confirm.state: "Жду подтверждение",
             Dialog.revoke.state: "Отправь ID пользователя из /members",

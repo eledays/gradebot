@@ -222,20 +222,21 @@ def test_legacy_self_registered_users_do_not_receive_access(tmp_path):
         db.close()
 
 
-async def test_admin_can_delete_table_by_button_with_confirmation(app):
+async def test_admin_can_delete_table_by_id_with_confirmation(app):
     sheet_id = app.db.add_sheet(
         "Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved"
     )
     await app.send("Удалить таблицу")
     method = app.bot.session.await_args.args[1]
-    assert method.reply_markup.inline_keyboard[0][0].callback_data == f"pick_remove:{sheet_id}"
-    await app.click(f"pick_remove:{sheet_id}")
+    assert f"#{sheet_id}: Матан" in method.text
+    assert method.reply_markup is None
+    await app.send(str(sheet_id))
     assert app.db.all("SELECT * FROM sheets")
     data = await app.context().get_data()
     await app.click(f"remove:{data['token']}")
     assert not app.db.all("SELECT * FROM sheets")
-    await app.click(f"pick_remove:{sheet_id}")
-    assert "не найдена" in app.replies()[-1]
+    await app.send("Удалить таблицу")
+    assert app.replies()[-1] == "Таблиц пока нет"
 
 
 async def test_admin_can_revoke_by_id_and_outsider_cannot(app):

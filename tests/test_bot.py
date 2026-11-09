@@ -472,6 +472,45 @@ async def test_id_selection_allows_reading_tables_retries_and_cancel(dialog_bot,
         assert "Квиз: 5" in h.replies()[-1]
 
 
+@pytest.mark.parametrize("command,user_id,state_name", [
+    ("/subject", 123, "subject_id"),
+    ("/columns", 999, "columns_id"),
+    ("/remove", 999, "remove"),
+    ("/addtab", 999, "addtab_id"),
+])
+async def test_sheet_id_commands_include_compact_escaped_preview(dialog_bot, command, user_id, state_name):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    first = h.db.add_sheet("Матан <1>", "https://docs.google.com/spreadsheets/d/first/edit",
+                           1, (1,), 999, "approved")
+    second = h.db.add_sheet("Физика & химия", "https://docs.google.com/spreadsheets/d/second/edit",
+                            1, (1,), 999, "approved")
+    await h.send(command, user_id)
+    method = h.bot.session.await_args.args[1]
+    assert await h.state(user_id) == getattr(Dialog, state_name).state
+    assert method.parse_mode == "HTML"
+    assert f"#{first}: Матан &lt;1&gt;" in method.text
+    assert f"#{second}: Физика &amp; химия" in method.text
+    assert method.reply_markup is None
+
+
+async def test_addtab_retries_invalid_and_missing_id(dialog_bot):
+    from gradebot.bot import Dialog
+
+    h = dialog_bot
+    h.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/book/edit", 1, (1,), 999, "approved")
+    await h.send("/addtab", 999)
+    for value in ("не число", "0", "-1", "9" * 30):
+        await h.send(value, 999)
+        assert "числовой ID" in h.replies()[-1]
+        assert await h.state(999) == Dialog.addtab_id.state
+    await h.send("999", 999)
+    assert "Таблица не найдена" in h.replies()[-1]
+    assert await h.state(999) == Dialog.addtab_id.state
+
+
 @pytest.mark.parametrize("command,user_id", [("/columns", 999), ("/subject", 123)])
 async def test_id_commands_with_no_sheets_do_not_wait_for_input(dialog_bot, command, user_id):
     h = dialog_bot
@@ -1018,9 +1057,10 @@ async def test_add_tab_to_existing_workbook_uses_only_new_tabs(dialog_bot, monke
     original = h.db.add_sheet("Матан", tabs[0]["url"], 1, (1,), 999, "approved")
     monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
     await h.send("/addtab", 999)
-    markup = h.bot.session.await_args.args[1].reply_markup
-    assert markup.inline_keyboard[0][0].callback_data == f"extend:{original}"
-    await h.callback(f"extend:{original}")
+    assert await h.state(999) == Dialog.addtab_id.state
+    assert f"#{original}: Матан" in h.replies()[-1]
+    assert h.bot.session.await_args.args[1].reply_markup is None
+    await h.send(str(original), 999)
     data = await setup_data(h)
     assert data["tabs"] == [tabs[1]]
     assert data["selected"] == [0]
@@ -1036,7 +1076,7 @@ async def test_add_tab_to_existing_workbook_uses_only_new_tabs(dialog_bot, monke
     assert len(h.db.all("SELECT * FROM sheet_cache")) == 1
     assert json.loads(h.db.all("SELECT tabs FROM workbook_watch")[0][0]) == tabs
     await h.send("/addtab", 999)
-    await h.callback(f"extend:{original}")
+    await h.send(str(original), 999)
     assert h.replies()[-1] == "Новых листов в этой таблице пока нет"
     assert await h.state(999) is None
 
@@ -1048,7 +1088,7 @@ async def test_add_tab_rechecks_duplicate_before_saving(dialog_bot, monkeypatch)
     original = h.db.add_sheet("Матан", tabs[0]["url"], 1, (1,), 999, "approved")
     monkeypatch.setattr("gradebot.bot.discover_sheets", AsyncMock(return_value=tabs))
     await h.send("/addtab", 999)
-    await h.callback(f"extend:{original}")
+    await h.send(str(original), 999)
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
     await h.send("готово", 999)
