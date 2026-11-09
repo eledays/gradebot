@@ -265,9 +265,9 @@ async def test_last_sheet_offer_can_remove_empty_workbook(app):
 async def test_remove_table_deletes_all_its_sheets_and_related_rows(app):
     app.db.register(123, "Иванов Иван")
     base = "https://docs.google.com/spreadsheets/d/algebra/edit#gid="
-    first = app.db.add_sheet("Алгебра & КР · Первый", base + "1", 1, (1,), 999, "approved",
+    first = app.db.add_sheet("Алгебра & КР - Первый", base + "1", 1, (1,), 999, "approved",
                              parsed=Sheet([["ФИО", "Оценка"], ["Иванов Иван", "5"]]))
-    second = app.db.add_sheet("Алгебра & КР · Второй", base + "2", 1, (1,), 999, "approved")
+    second = app.db.add_sheet("Алгебра & КР - Второй", base + "2", 1, (1,), 999, "approved")
     other = app.db.add_sheet("История", "https://docs.google.com/spreadsheets/d/history/edit",
                              1, (1,), 999, "approved")
     workbook_id = app.db.all("SELECT workbook_id FROM sheets WHERE id=?", (first,))[0][0]
@@ -303,7 +303,7 @@ async def test_remove_table_confirmation_rejects_changed_sheet_set(app):
     await app.send("/removetable")
     await app.send(str(workbook_id))
     data = await app.context().get_data()
-    app.db.add_sheet("Матан · Второй", "https://docs.google.com/spreadsheets/d/book/edit#gid=2",
+    app.db.add_sheet("Матан - Второй", "https://docs.google.com/spreadsheets/d/book/edit#gid=2",
                      1, (1,), 999, "approved")
     await app.click(f"remove_table:{data['token']}")
     assert "Состав таблицы изменился" in app.replies()[-1]
@@ -312,10 +312,10 @@ async def test_remove_table_confirmation_rejects_changed_sheet_set(app):
 
 
 async def test_removing_one_of_two_sheets_keeps_workbook_without_offer(app):
-    first = app.db.add_sheet("Алгебра · Первый",
+    first = app.db.add_sheet("Алгебра - Первый",
                              "https://docs.google.com/spreadsheets/d/book/edit#gid=1",
                              1, (1,), 999, "approved")
-    second = app.db.add_sheet("Алгебра · Второй",
+    second = app.db.add_sheet("Алгебра - Второй",
                               "https://docs.google.com/spreadsheets/d/book/edit#gid=2",
                               1, (1,), 999, "approved")
     await app.send("/remove")

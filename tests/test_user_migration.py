@@ -53,8 +53,8 @@ def test_v1_workbook_migration_groups_tabs_without_changing_sheet_ids(tmp_path):
                 header_row INTEGER NOT NULL, name_columns TEXT NOT NULL, proposer INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending', parser_options TEXT NOT NULL DEFAULT '{}');
             INSERT INTO sheets(id,title,url,header_row,name_columns,proposer,status) VALUES
-                (7,'Алгебра · Лист1','https://docs.google.com/spreadsheets/d/algebra/edit#gid=1',1,'[1]',999,'approved'),
-                (8,'Алгебра · Лист3','https://docs.google.com/spreadsheets/d/algebra/edit#gid=3',1,'[1]',999,'approved'),
+                (7,'Алгебра \u00b7 Лист1','https://docs.google.com/spreadsheets/d/algebra/edit#gid=1',1,'[1]',999,'approved'),
+                (8,'Алгебра \u00b7 Лист3','https://docs.google.com/spreadsheets/d/algebra/edit#gid=3',1,'[1]',999,'approved'),
                 (9,'Простые оценки','https://docs.google.com/spreadsheets/d/simple/edit',1,'[1]',999,'approved');
         """)
     db = Database(str(path))
@@ -92,7 +92,7 @@ def test_cli_user_removal_requires_confirmation_and_cleans_references(
         db.execute("INSERT INTO registration_drafts VALUES(123,'token')")
         db.execute("INSERT INTO views(id,owner,pages) VALUES('view',123,'[]')")
         db.execute("INSERT INTO views(id,owner,pages,admin) "
-                   "VALUES('members',999,'[\"#123: Example User · ID 123\"]',1)")
+                   "VALUES('members',999,'[\"#123: Example User - ID 123\"]',1)")
         db.execute("INSERT INTO views(id,owner,pages,admin) VALUES('proposal',999,'[]',1)")
         db.execute("INSERT INTO outbox(user_id,text) VALUES(123,'queued')")
         db.execute("INSERT INTO outbox(user_id,text,view_id,kind) "

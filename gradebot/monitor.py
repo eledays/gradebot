@@ -60,7 +60,7 @@ def cache_caption(report: CacheState, label: str = "Последнее обно�
     if timestamp is None:
         return "<i>Кэш ещё не загружен</i>"
     date = datetime.fromtimestamp(timestamp, ZoneInfo("Europe/Moscow")).strftime("%d.%m.%Y %H:%M:%S МСК")
-    prefix = "Кэш устарел · " if report["stale"] else ""
+    prefix = "Кэш устарел. " if report["stale"] else ""
     return f"<i>{prefix}{label}: {date}</i>"
 
 
@@ -346,13 +346,16 @@ class Monitor:
                     if not changes or not user["notifications"]:
                         continue
                     lines = [bold("Найдены новые оценки"), ""]
+                    grade_sections: dict[int, list[str]] = {}
                     for sheet_id, values in changes.items():
                         sheet = active[sheet_id]
-                        lines.append(bold(self.db.grade_display_title(sheet["title"], sheet["url"])))
+                        section = [bold(self.db.grade_display_title(sheet["title"], sheet["url"]))]
                         for column, value in values:
-                            lines.extend(safe_lines(f"- {column}: {value}"))
-                        lines.append("")
-                    self.db.queue(user["telegram_id"], lines)
+                            section.extend(safe_lines(f"- {column}: {value}"))
+                        section.append("")
+                        grade_sections[sheet_id] = section
+                        lines.extend(section)
+                    self.db.queue(user["telegram_id"], lines, grade_sections=grade_sections)
                     notifications += 1
         await self.deliver()
         return {"updated": len(fetched), "failed": failed, "notifications": notifications,

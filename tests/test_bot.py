@@ -449,8 +449,8 @@ async def test_grades_group_tabs_with_full_titles_and_no_actions(dialog_bot):
     h = dialog_bot
     h.db.register(123, "Иванов Иван")
     for index, (book, title) in enumerate([
-        ("org", "ОРГ"), ("algebra", "Алгебра · Семинары"),
-        ("other", "Другой предмет"), ("algebra", "Алгебра · КР 1"),
+        ("org", "ОРГ"), ("algebra", "Алгебра - Семинары"),
+        ("other", "Другой предмет"), ("algebra", "Алгебра - КР 1"),
     ]):
         h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
                        1, (1,), 999, "approved",
@@ -477,7 +477,7 @@ async def test_grades_show_original_tab_name_and_readable_column_paths(dialog_bo
          ["Иванов Иван", "1", "2"]], 2, (1,), 1
     )
     h.db.add_sheet("Алгебра", base + "1", 2, (1,), 999, "approved", parsed=first)
-    h.db.add_sheet("Алгебра · Лист3", base + "3", 1, (1,), 999, "approved",
+    h.db.add_sheet("Алгебра - Лист3", base + "3", 1, (1,), 999, "approved",
                    parsed=Sheet([["ФИО", "Ну"], ["Иванов Иван", "2"]]))
     with h.db.conn:
         h.db.remember_workbook(base + "1", [
@@ -575,8 +575,8 @@ async def test_addtab_lists_workbooks_and_uses_workbook_id_not_sheet_id(dialog_b
     h = dialog_bot
     algebra = "https://docs.google.com/spreadsheets/d/algebra/edit#gid="
     simple = "https://docs.google.com/spreadsheets/d/simple/edit#gid="
-    h.db.add_sheet("Алгебра · Лист1", algebra + "1", 1, (1,), 999, "approved")
-    h.db.add_sheet("Алгебра · Лист3", algebra + "3", 1, (1,), 999, "approved")
+    h.db.add_sheet("Алгебра - Лист1", algebra + "1", 1, (1,), 999, "approved")
+    h.db.add_sheet("Алгебра - Лист3", algebra + "3", 1, (1,), 999, "approved")
     h.db.add_sheet("Простые оценки", simple + "1", 1, (1,), 999, "approved")
     workbooks = h.db.extension_workbooks()
     assert len(workbooks) == 2
@@ -615,7 +615,7 @@ async def test_tables_group_workbook_tabs_without_action_buttons(dialog_bot):
     from gradebot.presentation import view_markup
 
     h = dialog_bot
-    titles = ["ОРГ", "Алгебра · Семинары 1 модуль", "Другая таблица", "Алгебра · КР 1"]
+    titles = ["ОРГ", "Алгебра - Семинары 1 модуль", "Другая таблица", "Алгебра - КР 1"]
     urls = ["org", "algebra", "other", "algebra"]
     for index, (title, book) in enumerate(zip(titles, urls, strict=True)):
         h.db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={index}",
@@ -627,7 +627,7 @@ async def test_tables_group_workbook_tabs_without_action_buttons(dialog_bot):
     text = h.replies()[-1]
     assert '<b>Алгебра</b>\n#2: <a href=' in text
     assert ">Семинары 1 модуль</a>" in text and ">КР 1</a>" in text
-    assert "Алгебра ·" not in text
+    assert "Алгебра - " not in text
     assert text.index("#1:") < text.index("#2:") < text.index("#4:") < text.index("#3:")
     assert text.count("Последнее обновление:") == 3
     assert "#gid=1" in text and "#gid=3" in text
@@ -654,7 +654,7 @@ async def test_table_group_cache_status_includes_all_tabs(dialog_bot, monkeypatc
     h = dialog_bot
     monkeypatch.setattr("gradebot.bot.time.time", lambda: 1000)
     for index, timestamp in enumerate(timestamps):
-        sheet_id = h.db.add_sheet(f"Алгебра · Лист {index}",
+        sheet_id = h.db.add_sheet(f"Алгебра - Лист {index}",
                                   f"https://docs.google.com/spreadsheets/d/algebra/edit#gid={index}",
                                   1, (1,), 999, "approved")
         if timestamp is not None:
@@ -672,9 +672,9 @@ async def test_table_group_cache_status_includes_all_tabs(dialog_bot, monkeypatc
 async def test_table_groups_use_workbook_identity_and_escape_titles(dialog_bot):
     h = dialog_bot
     for index, (book, title) in enumerate([
-        ("first", "Алгебра <1> · Семинар & КР"),
-        ("second", "Алгебра <1> · Экзамен"),
-        ("first", "Алгебра <1> · Итоги · Модуль 1"),
+        ("first", "Алгебра <1> - Семинар & КР"),
+        ("second", "Алгебра <1> - Экзамен"),
+        ("first", "Алгебра <1> - Итоги - Модуль 1"),
         ("legacy", "Старое название"),
         ("legacy", "Отдельное название"),
     ]):
@@ -683,8 +683,8 @@ async def test_table_groups_use_workbook_identity_and_escape_titles(dialog_bot):
     await h.send("/tables")
     text = h.replies()[-1]
     assert text.count("<b>Алгебра &lt;1&gt;</b>") == 1
-    assert ">Семинар &amp; КР</a>" in text and ">Итоги · Модуль 1</a>" in text
-    assert ">Алгебра &lt;1&gt; · Экзамен</a>" in text  # Another file remains a single table.
+    assert ">Семинар &amp; КР</a>" in text and ">Итоги - Модуль 1</a>" in text
+    assert ">Алгебра &lt;1&gt; - Экзамен</a>" in text  # Another file remains a single table.
     assert "<b>Старое название</b>" in text
     assert ">Старое название</a>" in text and ">Отдельное название</a>" in text
 
@@ -835,15 +835,28 @@ async def test_title_taken_during_link_input_returns_to_title(dialog_bot, monkey
     assert len(h.db.all("SELECT * FROM sheets")) == 1
 
 
-async def test_start_opens_admin_menu_without_student_registration(dialog_bot):
+async def test_start_registers_admin_as_user_before_opening_menu(dialog_bot):
     h = dialog_bot
     await h.send("/start", 999)
-    assert "Панель администратора" in h.replies()[-1]
-    method = h.bot.session.await_args.args[1]
+    assert "отправь ФИО" in h.replies()[-1]
+    assert not h.db.all("SELECT * FROM users")
+    await h.send("Иван", 999)
+    assert "Нужно 2–3 полных слова" in h.replies()[-1]
+    await h.send("Иванов Иван", 999)
+    assert h.db.member_name(999) == "Иванов Иван"
+    assert h.db.user_name(999) == "Иванов Иван"
+    assert any("Добро пожаловать, Иван!" in reply for reply in h.replies())
+    method = next(
+        call.args[1] for call in reversed(h.bot.session.await_args_list)
+        if getattr(call.args[1], "reply_markup", None) is not None
+    )
     labels = [button.text for row in method.reply_markup.keyboard for button in row]
     assert "Создать ссылку" in labels
     assert "Добавить таблицу" in labels
-    assert not h.db.all("SELECT * FROM users")
+    assert "Мои оценки" in labels
+    previous_replies = len(h.replies())
+    await h.send("/start", 999)
+    assert any(reply.startswith("Привет, Иван!") for reply in h.replies()[previous_replies:])
 
 
 async def test_start_uses_assigned_name_and_opens_simple_menu(dialog_bot):
@@ -883,7 +896,7 @@ async def test_help_greets_saved_name_and_shows_latest_approved_cache(dialog_bot
     await h.send("/help")
     text = h.replies()[-1]
     assert text.startswith("Рад тебя видеть, Иван\n\n")
-    assert text.endswith("<i>Кэш устарел · Последнее обновление кэша: 15.11.2023 02:13:20 МСК</i>")
+    assert text.endswith("<i>Кэш устарел. Последнее обновление кэша: 15.11.2023 02:13:20 МСК</i>")
     h.db.register(123, "Петров Петр")
     await h.send("/help")
     assert h.replies()[-1].startswith("Рад тебя видеть, Петр\n\n")
@@ -1131,7 +1144,7 @@ async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypa
     assert not h.db.all("SELECT * FROM sheets")
     await h.callback(f"worksave:{token}")
     saved = h.db.all("SELECT * FROM sheets")[0]
-    assert saved["title"] == "Матан · Квизы"
+    assert saved["title"] == "Матан - Квизы"
     assert json.loads(saved["parser_options"]) == {"header_start": 1, "grade_columns": [3, 5]}
     h.db.register(123, "Иванов Иван")
     reports = await h.monitor.inspect_user(123)
@@ -1167,7 +1180,7 @@ async def test_add_tab_to_existing_workbook_uses_only_new_tabs(dialog_bot, monke
     await h.callback(f"worksave:{data['setup_token']}")
     rows = h.db.all("SELECT id,title,url FROM sheets ORDER BY id")
     assert [(row["title"], row["url"]) for row in rows] == [
-        ("Матан", tabs[0]["url"]), ("Матан · Второй", tabs[1]["url"])
+        ("Матан", tabs[0]["url"]), ("Матан - Второй", tabs[1]["url"])
     ]
     assert rows[0]["id"] == original
     stored = h.db.all("SELECT workbook_id,tab_name FROM sheets ORDER BY id")
@@ -1214,10 +1227,10 @@ async def test_workbook_save_rolls_back_every_sheet_on_conflict(dialog_bot, monk
     for _ in tabs:
         await h.send("1 A", 999)
         await h.send("готово", 999)
-    h.db.add_sheet("Матан · Второй", "https://docs.google.com/spreadsheets/d/conflict/edit", 1, (1,),
+    h.db.add_sheet("Матан - Второй", "https://docs.google.com/spreadsheets/d/conflict/edit", 1, (1,),
                    999, "approved")
     await h.callback(f"worksave:{token}")
-    assert [row["title"] for row in h.db.all("SELECT * FROM sheets")] == ["Матан · Второй"]
+    assert [row["title"] for row in h.db.all("SELECT * FROM sheets")] == ["Матан - Второй"]
     assert not h.db.all("SELECT * FROM sheet_cache")
     assert not h.db.all("SELECT * FROM outbox")
 
@@ -1250,7 +1263,7 @@ async def test_proposal_picker_selection_survives_until_admin_configuration(dial
     await h.send("готово", 999)
     await h.callback(f"worksave:{data['setup_token']}")
     saved = h.db.all("SELECT * FROM sheets")[0]
-    assert saved["title"] == "Матан · Второй" and saved["status"] == "approved"
+    assert saved["title"] == "Матан - Второй" and saved["status"] == "approved"
     assert saved["url"] == tabs[1]["url"]
 
 
@@ -1308,7 +1321,7 @@ async def test_compact_auto_setup_buttons_and_stale_sheet_callback(dialog_bot, m
     ready = h.bot.session.await_args.args[1]
     assert ready.text.startswith("Готово к сохранению:")
     assert "Матан. Семинары:" in ready.text and "Матан. Квизы:" in ready.text
-    assert " · " not in ready.text
+    assert " - " not in ready.text
     assert ready.reply_markup.inline_keyboard[0][0].text == "Сохранить"
     await h.callback(f"worksave:{token}")
     assert len(h.db.all("SELECT * FROM sheets WHERE status='approved'")) == 2

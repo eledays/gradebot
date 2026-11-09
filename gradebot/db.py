@@ -8,10 +8,17 @@ from typing import NotRequired, TypedDict
 
 from .logging_setup import audit
 from .messages import messages
-from .presentation import bold, create_view, table_link
+from .presentation import bold, create_view, paginate, table_link
 from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
-from .structure import header_signature, sheet_group_title, workbook_url
+from .structure import (
+    LEGACY_TITLE_SEPARATOR,
+    TITLE_SEPARATOR,
+    header_signature,
+    sheet_group_title,
+    tab_name_from_title,
+    workbook_url,
+)
 
 
 class WorkbookTab(TypedDict):
@@ -107,6 +114,19 @@ class Database:
         """Internal administrator/test helper."""
         self.grant_members([(user_id, "", name)])
         self.activate(user_id)
+
+    def register_admin(self, user_id: int, username: str | None, name: str) -> bool:
+        """Create the administrator's member and active profile after name entry."""
+        with self.conn:
+            if user_id != self.admin_id() or self.blocked(user_id):
+                return False
+            self.conn.execute(
+                "INSERT INTO members(id,name,username) VALUES(?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,username=excluded.username",
+                (user_id, name, username or ""),
+            )
+            self._save_name(user_id, name)
+        return True
 
     def authorized(self, user_id: int) -> bool:
         """Check whether a user may interact with the bot."""
@@ -321,7 +341,7 @@ class Database:
         if existing:
             return int(existing[0]["id"])
         return int(self.conn.execute(
-            "INSERT INTO workbooks(title,url) VALUES(?,?)", (title, base)
+            "INSERT INTO workbooks(title,url,retain_empty) VALUES(?,?,0)", (title, base)
         ).lastrowid)
 
     def add_sheet(self, title: str, url: str, header_row: int, columns: Sequence[int],
@@ -343,14 +363,14 @@ class Database:
                         for previous in group:
                             self.conn.execute(
                                 "UPDATE sheets SET tab_name=? WHERE workbook_id=? AND title=?",
-                                (str(previous["title"]).removeprefix(shared + " · "), workbook_id,
+                                (tab_name_from_title(str(previous["title"]), shared), workbook_id,
                                  previous["title"]),
                             )
             workbook = self.all("SELECT title,url FROM workbooks WHERE id=?", (workbook_id,))
             if not workbook or workbook[0]["url"] != workbook_url(url):
                 raise SheetError("Лист не принадлежит указанной таблице")
             if tab_name is None:
-                tab_name = title.removeprefix(str(workbook[0]["title"]) + " · ")
+                tab_name = tab_name_from_title(title, str(workbook[0]["title"]))
             sheet_id = int(self.all("SELECT value FROM settings WHERE key='sheet_sequence'")[0][0]) + 1
             self.conn.execute("UPDATE settings SET value=? WHERE key='sheet_sequence'", (str(sheet_id),))
             self.conn.execute(
@@ -442,16 +462,55 @@ class Database:
         self.conn.execute("UPDATE sheet_cache SET fetched_at=? WHERE sheet_id=?", (fetched_at, sheet_id))
 
     def queue(self, user_id: int, lines: Sequence[str], *, kind: str = "grades",
-              actions: object = None, admin: bool = False) -> None:
+              actions: object = None, admin: bool = False,
+              grade_sections: dict[int, list[str]] | None = None) -> None:
         """Enqueue a notification and its view in the current transaction."""
         with nullcontext() if self.conn.in_transaction else self.conn:
             if not self.conn.in_transaction:
                 self.conn.execute("BEGIN")
             view_id, pages = create_view(self, user_id, lines, admin=admin, actions=actions)
             self.conn.execute(
-                "INSERT INTO outbox(user_id,text,view_id,kind,created_at) VALUES(?,?,?,?,?)",
-                (user_id, pages[0], view_id, kind, time.time()),
+                "INSERT INTO outbox(user_id,text,view_id,kind,created_at,grade_sections) "
+                "VALUES(?,?,?,?,?,?)",
+                (user_id, pages[0], view_id, kind, time.time(),
+                 json.dumps(grade_sections) if grade_sections is not None else None),
             )
+
+    def _prune_grade_notifications(self, sheet_ids: Sequence[int]) -> None:
+        """Remove deleted sheets from pending grade messages without losing other sheets' changes."""
+        removed = set(sheet_ids)
+        if not removed:
+            return
+        for item in self.all(
+            "SELECT id,view_id,grade_sections FROM outbox WHERE status='pending' AND kind='grades'"
+        ):
+            payload = item["grade_sections"]
+            if payload is None:
+                # Old queued messages have no sheet identity, so their freshness cannot be checked.
+                self.conn.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
+                if item["view_id"]:
+                    self.conn.execute("DELETE FROM views WHERE id=?", (item["view_id"],))
+                continue
+            sections = json.loads(payload)
+            kept = {key: lines for key, lines in sections.items() if int(key) not in removed}
+            if len(kept) == len(sections):
+                continue
+            if not kept:
+                self.conn.execute("DELETE FROM outbox WHERE id=?", (item["id"],))
+                if item["view_id"]:
+                    self.conn.execute("DELETE FROM views WHERE id=?", (item["view_id"],))
+                continue
+            lines = [bold("Найдены новые оценки"), ""]
+            for section_lines in kept.values():
+                lines.extend(section_lines)
+            pages = paginate(lines)
+            self.conn.execute(
+                "UPDATE outbox SET text=?,grade_sections=? WHERE id=?",
+                (pages[0], json.dumps(kept), item["id"]),
+            )
+            if item["view_id"]:
+                self.conn.execute("UPDATE views SET pages=? WHERE id=?",
+                                  (json.dumps(pages), item["view_id"]))
 
     def remember_workbook(self, url: str, tabs: list[dict[str, str]], *, replace: bool = False) -> None:
         """Record discovered tabs and refresh stored names of saved sheets."""
@@ -599,8 +658,8 @@ class Database:
             )[0]["n"]
             if count > 1:
                 return f"{stored[0]['workbook_title']}. {stored[0]['tab_name']}"
-        if " · " in title:
-            return title.replace(" · ", ". ")
+        if TITLE_SEPARATOR in title or LEGACY_TITLE_SEPARATOR in title:
+            return title.replace(TITLE_SEPARATOR, ". ").replace(LEGACY_TITLE_SEPARATOR, ". ")
         watched = self.all("SELECT tabs FROM workbook_watch WHERE url=?", (workbook_url(url),))
         if not watched:
             return title
@@ -658,8 +717,11 @@ class Database:
             sheet = self.approved_sheet_with_workbook(sheet_id)
             if sheet is None:
                 return None
+            self._prune_grade_notifications([sheet_id])
             self.conn.execute("DELETE FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
             empty = not self.all("SELECT 1 FROM sheets WHERE workbook_id=?", (sheet["workbook_id"],))
+            if empty:
+                self.conn.execute("UPDATE workbooks SET retain_empty=1 WHERE id=?", (sheet["workbook_id"],))
             return {"workbook_id": int(sheet["workbook_id"]),
                     "workbook_title": str(sheet["workbook_title"]), "workbook_empty": empty}
 
@@ -671,6 +733,7 @@ class Database:
             workbook = self.workbook_for_removal(workbook_id)
             if workbook is None or workbook["sheet_ids"] != list(expected_sheet_ids):
                 return None
+            self._prune_grade_notifications(workbook["sheet_ids"])
             self.conn.execute("DELETE FROM sheets WHERE workbook_id=?", (workbook_id,))
             self.conn.execute("DELETE FROM workbook_watch WHERE url=(SELECT url FROM workbooks WHERE id=?)",
                               (workbook_id,))
@@ -701,6 +764,14 @@ class Database:
                 self.broadcast_table(sheet["title"], sheet["url"])
             else:
                 self.conn.execute("DELETE FROM sheets WHERE id=?", (sheet_id,))
+                removed_parent = self.conn.execute(
+                    "DELETE FROM workbooks WHERE id=? AND retain_empty=0 "
+                    "AND NOT EXISTS (SELECT 1 FROM sheets WHERE workbook_id=?)",
+                    (sheet["workbook_id"], sheet["workbook_id"]),
+                )
+                if removed_parent.rowcount:
+                    self.conn.execute("DELETE FROM workbook_watch WHERE url=?",
+                                      (workbook_url(sheet["url"]),))
             self.queue(sheet["proposer"], [bold("Таблица одобрена" if approve else "Таблица отклонена"),
                        "", table_link(sheet["title"], sheet["url"])], kind="moderation")
         return True

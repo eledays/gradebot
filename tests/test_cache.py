@@ -64,10 +64,10 @@ async def test_failed_refresh_preserves_cache_and_its_timestamp(db):
 @pytest.mark.parametrize("changed", [{2, 3, 4}, {4}, {3}, set()])
 async def test_notification_lists_changed_tabs_individually(db, changed):
     specifications = [
-        ("Алгебра · Семинары 1 модуль", "algebra", 0),
-        ("Другой предмет · Лист1", "other", 0),
-        ("Алгебра · Итоги I семестр", "algebra", 1),
-        ("Алгебра · Неизменённый лист", "algebra", 2),
+        ("Алгебра - Семинары 1 модуль", "algebra", 0),
+        ("Другой предмет - Лист1", "other", 0),
+        ("Алгебра - Итоги I семестр", "algebra", 1),
+        ("Алгебра - Неизменённый лист", "algebra", 2),
     ]
     for title, book, gid in specifications:
         db.add_sheet(title, f"https://docs.google.com/spreadsheets/d/{book}/edit#gid={gid}",
@@ -102,7 +102,7 @@ async def test_notification_lists_changed_tabs_individually(db, changed):
 async def test_notification_sheet_titles_escape_html_without_grouping(db):
     monitor = Monitor(db, None, AsyncMock())
     for gid, leaf in enumerate(["Лист <1>", "Лист &2"]):
-        db.add_sheet(f"Предмет <&> · {leaf}", f"https://docs.google.com/spreadsheets/d/book{gid}/edit",
+        db.add_sheet(f"Предмет <&> - {leaf}", f"https://docs.google.com/spreadsheets/d/book{gid}/edit",
                      1, (1,), 999, "approved", parsed=parsed("5"))
     await monitor.inspect_user(123, baseline=True)
     monitor.fetch = AsyncMock(return_value=parsed("4"))

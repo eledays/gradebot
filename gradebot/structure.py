@@ -10,6 +10,8 @@ from .sheets import SheetError, detect_layout, sheet_url
 
 SheetRow = Mapping[str, object] | sqlite3.Row
 RowT = TypeVar("RowT", bound=SheetRow)
+TITLE_SEPARATOR = " - "
+LEGACY_TITLE_SEPARATOR = " \u00b7 "
 
 
 
@@ -31,11 +33,21 @@ def group_sheets(sheets: Sequence[RowT]) -> list[list[RowT]]:
 def sheet_group_title(sheets: Sequence[SheetRow]) -> str:
     """Find the shared prefix in a group of tab titles."""
     common = []
-    for parts in zip(*(sheet["title"].split(" · ")[:-1] for sheet in sheets), strict=False):
+    for parts in zip(*(str(sheet["title"]).replace(LEGACY_TITLE_SEPARATOR, TITLE_SEPARATOR)
+                       .split(TITLE_SEPARATOR)[:-1] for sheet in sheets), strict=False):
         if len(set(parts)) != 1:
             break
         common.append(parts[0])
-    return " · ".join(common)
+    return TITLE_SEPARATOR.join(common)
+
+
+def tab_name_from_title(title: str, workbook_title: str) -> str:
+    """Remove a workbook prefix from new and historical sheet titles."""
+    for separator in (TITLE_SEPARATOR, LEGACY_TITLE_SEPARATOR):
+        prefix = workbook_title + separator
+        if title.startswith(prefix):
+            return title[len(prefix):]
+    return title
 
 
 def header_signature(rows: list[list[str]], header_row: int,

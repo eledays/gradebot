@@ -5,7 +5,13 @@ import re
 import sqlite3
 
 from .sheets import sheet_url
-from .structure import sheet_group_title, workbook_url
+from .structure import (
+    LEGACY_TITLE_SEPARATOR,
+    TITLE_SEPARATOR,
+    sheet_group_title,
+    tab_name_from_title,
+    workbook_url,
+)
 
 SCHEMA_VERSION = 2
 
@@ -59,6 +65,7 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         ("attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("next_attempt", "REAL NOT NULL DEFAULT 0"),
         ("created_at", "REAL NOT NULL DEFAULT 0"),
+        ("grade_sections", "TEXT"),
     ]:
         if column not in existing:
             conn.execute(f"ALTER TABLE outbox ADD COLUMN {column} {definition}")
@@ -72,6 +79,9 @@ def initialize_database(conn: sqlite3.Connection) -> None:
         _migrate_users(conn)
     if version < 2:
         _migrate_workbooks(conn)
+    if "retain_empty" not in {row["name"] for row in conn.execute("PRAGMA table_info(workbooks)")}:
+        # Existing empty workbooks may have been deliberately kept after removing their last sheet.
+        conn.execute("ALTER TABLE workbooks ADD COLUMN retain_empty INTEGER NOT NULL DEFAULT 1")
     # Migrate CSV URLs without producing duplicate logical sheets.
     with conn:
         conn.execute("CREATE INDEX IF NOT EXISTS sheets_workbook_status ON sheets(workbook_id,status)")
@@ -150,8 +160,11 @@ def _migrate_workbooks(conn: sqlite3.Connection) -> None:
             } if watched else {}
             if len(sheets) == 1:
                 tab_name = known_tabs.get(sheet_url(sheets[0]["url"]))
-                if tab_name and title.endswith(" · " + tab_name):
-                    title = title.removesuffix(" · " + tab_name)
+                if tab_name:
+                    for separator in (TITLE_SEPARATOR, LEGACY_TITLE_SEPARATOR):
+                        if title.endswith(separator + tab_name):
+                            title = title.removesuffix(separator + tab_name)
+                            break
             workbook_id = conn.execute(
                 "INSERT INTO workbooks(title,url) VALUES(?,?)", (title, url)
             ).lastrowid
@@ -159,7 +172,8 @@ def _migrate_workbooks(conn: sqlite3.Connection) -> None:
                 "UPDATE sheets SET workbook_id=?,tab_name=? WHERE id=?",
                 [(
                     workbook_id,
-                    known_tabs.get(sheet_url(sheet["url"]), str(sheet["title"]).removeprefix(title + " · ")),
+                    known_tabs.get(sheet_url(sheet["url"]),
+                                   tab_name_from_title(str(sheet["title"]), title)),
                     sheet["id"],
                 ) for sheet in sheets],
             )

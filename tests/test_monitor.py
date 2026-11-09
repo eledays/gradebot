@@ -98,8 +98,8 @@ async def test_fresh_sheet_is_reused_for_all_users(
 
 async def test_grade_notification_lists_each_sheet_with_full_title(db):
     base = "https://docs.google.com/spreadsheets/d/book/edit#gid="
-    db.add_sheet("Матан · Семинары", base + "1", 1, (1,), 123, "approved")
-    db.add_sheet("Матан · Экзамен", base + "2", 1, (1,), 123, "approved")
+    db.add_sheet("Матан - Семинары", base + "1", 1, (1,), 123, "approved")
+    db.add_sheet("Матан - Экзамен", base + "2", 1, (1,), 123, "approved")
     db.add_sheet("Физика", "https://docs.google.com/spreadsheets/d/other/edit#gid=0",
                  1, (1,), 123, "approved")
     for sheet in db.sheets_by_status("approved"):

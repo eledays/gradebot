@@ -47,7 +47,7 @@ from .sheets import (
     sheet_url,
     valid_name,
 )
-from .structure import group_sheets, header_signature
+from .structure import LEGACY_TITLE_SEPARATOR, TITLE_SEPARATOR, group_sheets, header_signature
 
 
 def given_name(full_name: str) -> str:
@@ -83,6 +83,7 @@ def help_message(interval: int, contact_username: str, *, admin: bool = False,
 
 
 class Dialog(StatesGroup):
+    admin_name = State()
     requested_name = State()
     revoke = State()
     revoke_confirm = State()
@@ -303,7 +304,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await message.answer(messages.render("access.blocked"))
             return
         if user_id == db.admin_id() and db.member_name(user_id) is None:
-            await message.answer(messages.render("replies.start_1"), reply_markup=menu(True))
+            await state.set_state(Dialog.admin_name)
+            await message.answer(messages.render("registration.intro"), parse_mode="HTML")
             return
         if not db.authorized(user_id):
             token = (message.text or "").partition(" ")[2].strip()
@@ -337,6 +339,28 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                 lines.append(cache_caption(report) + " " + escape(report["title"]))
         if lines:
             await send_view(message, db, lines)
+
+    @router.message(Dialog.admin_name, F.text, ~F.text.startswith("/"))
+    async def admin_name(message: Message, state: FSMContext) -> None:
+        """Register the administrator as a user after their first name entry."""
+        name = " ".join(message.text.split())
+        if not valid_name(name):
+            await message.answer(messages.render("registration.invalid_name"))
+            return
+        if not db.register_admin(message.from_user.id, message.from_user.username, name):
+            await state.clear()
+            await message.answer(messages.render("access.denied"))
+            return
+        await state.clear()
+        reports = await monitor.inspect_user(message.from_user.id, baseline=True)
+        await message.answer(
+            messages.render("registration.welcome", first_name=given_name(name)),
+            parse_mode="HTML",
+            reply_markup=menu(True),
+        )
+        summary = registration_summary(reports)
+        if summary:
+            await send_view(message, db, safe_lines(summary))
 
     async def has_join_draft(message: Message) -> bool:
         """Check whether a message belongs to an invitation signup."""
@@ -863,7 +887,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             lines.extend(
                 [
                     f"{anchor} {table_link(row['title'], row['url'])}",
-                    f"<i>Заголовок: {row['header_row']} · ФИО: {escape(row['name_columns'])}</i>",
+                    f"<i>Заголовок: {row['header_row']}. ФИО: {escape(row['name_columns'])}</i>",
                     "",
                 ]
             )
@@ -1007,7 +1031,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         for row in rows:
             label = f"@{row['username']}" if row["username"] else "без юзернейма"
             anchor = f"#{row['id']}:"
-            lines.extend(safe_lines(f"{anchor} {row['name']} · {label} · ID {row['id']}"))
+            lines.extend(safe_lines(f"{anchor} {row['name']} - {label} - ID {row['id']}"))
             lines.append("Вход выполнен" if row["active"] else "Ещё не заходил")
             lines.append("")
         await send_view(
@@ -1122,25 +1146,27 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             result = messages.render("replies.remove_table_kept" if data.get("after_last_sheet")
                                      else "replies.confirm_dismissed")
         else:
-            async with monitor.lock:
-                if action == "remove":
-                    removed = db.remove_approved_sheet(data["sheet_id"])
-                    result = messages.render("replies.remove_sheet_done" if removed
-                                             else "replies.remove_sheet_stale")
-                    if removed and removed["workbook_empty"]:
-                        offer_empty_table = removed["workbook_id"]
-                    audit("sheet_removed", sheet_id=data["sheet_id"], count=bool(removed))
-                elif action == "remove_table":
-                    deleted = db.remove_workbook(data["workbook_id"], data["expected_sheet_ids"])
-                    result = (messages.render("replies.remove_table_done", count=deleted)
-                              if deleted is not None else messages.render("replies.remove_table_stale"))
-                    audit("workbook_removed", workbook_id=data["workbook_id"], count=deleted or 0)
-                else:
-                    if data["member_id"] == db.admin_id():
-                        await callback.answer(messages.render("replies.confirm_3"), show_alert=True)
-                        return
-                    db.block(data["member_id"])
-                    result = messages.render("replies.revoke_done")
+            # Finish any in-flight delivery before removing data referenced by queued grade messages.
+            async with monitor.delivery_lock:
+                async with monitor.lock:
+                    if action == "remove":
+                        removed = db.remove_approved_sheet(data["sheet_id"])
+                        result = messages.render("replies.remove_sheet_done" if removed
+                                                 else "replies.remove_sheet_stale")
+                        if removed and removed["workbook_empty"]:
+                            offer_empty_table = removed["workbook_id"]
+                        audit("sheet_removed", sheet_id=data["sheet_id"], count=bool(removed))
+                    elif action == "remove_table":
+                        deleted = db.remove_workbook(data["workbook_id"], data["expected_sheet_ids"])
+                        result = (messages.render("replies.remove_table_done", count=deleted)
+                                  if deleted is not None else messages.render("replies.remove_table_stale"))
+                        audit("workbook_removed", workbook_id=data["workbook_id"], count=deleted or 0)
+                    else:
+                        if data["member_id"] == db.admin_id():
+                            await callback.answer(messages.render("replies.confirm_3"), show_alert=True)
+                            return
+                        db.block(data["member_id"])
+                        result = messages.render("replies.revoke_done")
         await state.clear()
         await callback.answer()
         if isinstance(callback.message, Message):
@@ -1242,8 +1268,11 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         title = data.get("title", "")
         if existing_urls and len(existing_urls) == 1:
             old_tab = next((tab for tab in all_tabs if sheet_url(tab["url"]) in existing_urls), None)
-            if old_tab and title.endswith(" · " + old_tab["name"]):
-                title = title.removesuffix(" · " + old_tab["name"])
+            if old_tab:
+                for separator in (TITLE_SEPARATOR, LEGACY_TITLE_SEPARATOR):
+                    if title.endswith(separator + old_tab["name"]):
+                        title = title.removesuffix(separator + old_tab["name"])
+                        break
         await state.update_data(title=title, tabs=tabs, all_tabs=all_tabs, selected=list(range(len(tabs))),
                                 setup_token=secrets.token_hex(8),
                                 tab_page=0, configured=[])
@@ -1405,7 +1434,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         data = await state.get_data()
         tab = data["tabs"][data["current_index"]]
         title = (data["title"] if len(data["tabs"]) == 1 and not data.get("extension_source")
-                 else f"{data['title']} · {tab['name']}")
+                 else f"{data['title']}{TITLE_SEPARATOR}{tab['name']}")
         configured = data["configured"] + [{
             "index": data["current_index"], "title": title, "tab_name": tab["name"], "url": tab["url"],
             "header": data["header"], "columns": data["columns"],

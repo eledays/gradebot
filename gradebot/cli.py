@@ -6,16 +6,14 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .db import Database
-from .logging_setup import audit, configure_logging
-from .runtime import AlreadyRunningError, database_run_lock, migrate_legacy_database
-
 
 def main() -> None:
     """Run the command-line entry point with safe error reporting."""
     try:
         _main()
     except Exception as exc:
+        from .logging_setup import audit
+
         audit("process_failed", level=logging.ERROR, error=exc)
         raise SystemExit("Бот завершил работу из-за ошибки; проверьте журнал событий") from None
 
@@ -37,6 +35,10 @@ def _main() -> None:
     run = commands.add_parser("run", help="Start polling Telegram and Google Sheets")
     run.add_argument("--interval", type=int, default=int(os.getenv("POLL_INTERVAL", "60")))
     args = parser.parse_args()
+    from .db import Database
+    from .logging_setup import audit, configure_logging
+    from .runtime import AlreadyRunningError, database_run_lock, migrate_legacy_database
+
     try:
         configure_logging(os.getenv("LOG_LEVEL", "INFO").upper())
     except ValueError as exc:
