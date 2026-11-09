@@ -74,7 +74,7 @@ def format_grades(report: GradeReport, *, limit: int | None = 3,
         if visible:
             lines.append("<pre>")
             for label, value in visible:
-                lines.extend(safe_lines(f"- {label}: {value}"))
+                lines.extend(safe_lines(f"- {label.replace(' → ', ' — ')}: {value}"))
             lines.append("</pre>")
         if not filled:
             lines.append("Оценок пока нет")
@@ -151,7 +151,7 @@ class Monitor:
             reports.append(
                 {
                     "sheet_id": sheet["id"],
-                    "title": sheet["title"],
+                    "title": self.db.grade_display_title(sheet["title"], sheet["url"]),
                     "url": sheet["url"],
                     "status": status,
                     "grades": grades,
@@ -323,7 +323,7 @@ class Monitor:
                     for sheet in sorted(active.values(), key=lambda item: item["id"]):
                         if sheet["id"] not in changes:
                             continue
-                        lines.append(bold(sheet["title"].replace(" · ", ". ")))
+                        lines.append(bold(self.db.grade_display_title(sheet["title"], sheet["url"])))
                         for column, value in changes[sheet["id"]]:
                             lines.extend(safe_lines(f"- {column}: {value}"))
                         lines.append("")

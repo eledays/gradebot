@@ -398,14 +398,43 @@ async def test_grades_group_tabs_with_full_titles_and_no_actions(dialog_bot):
     h.monitor.fetch = AsyncMock(side_effect=RuntimeError("must not call Google"))
     await h.send("/grades")
     text = h.replies()[-1]
-    assert text.index(">ОРГ</a>") < text.index(">Алгебра · Семинары</a>")
-    assert text.index(">Алгебра · Семинары</a>") < text.index(">Алгебра · КР 1</a>")
-    assert text.index(">Алгебра · КР 1</a>") < text.index(">Другой предмет</a>")
+    assert text.index(">ОРГ</a>") < text.index(">Алгебра. Семинары</a>")
+    assert text.index(">Алгебра. Семинары</a>") < text.index(">Алгебра. КР 1</a>")
+    assert text.index(">Алгебра. КР 1</a>") < text.index(">Другой предмет</a>")
     assert "<b>Алгебра</b>" not in text
     assert text.count("- С1: 5") == 4 and "- С1: 2" not in text
     view = h.db.all("SELECT * FROM views ORDER BY created_at DESC")[0]
     assert json.loads(view["actions"]) == []
     h.monitor.fetch.assert_not_called()
+
+
+async def test_grades_show_original_tab_name_and_readable_column_paths(dialog_bot):
+    h = dialog_bot
+    h.db.register(123, "Иванов Иван")
+    base = "https://docs.google.com/spreadsheets/d/algebra/edit#gid="
+    first = Sheet(
+        [["ФИО", "Модуль 1", ""], ["", "Что-то 1", "Что-то 2"],
+         ["Иванов Иван", "1", "2"]], 2, (1,), 1
+    )
+    h.db.add_sheet("Алгебра", base + "1", 2, (1,), 999, "approved", parsed=first)
+    h.db.add_sheet("Алгебра · Лист3", base + "3", 1, (1,), 999, "approved",
+                   parsed=Sheet([["ФИО", "Ну"], ["Иванов Иван", "2"]]))
+    with h.db.conn:
+        h.db.remember_workbook(base + "1", [
+            {"name": "Лист1", "url": base + "1"},
+            {"name": "Лист3", "url": base + "3"},
+        ])
+    await h.send("/grades")
+    method = h.bot.session.await_args.args[1]
+    text = method.text
+    assert method.parse_mode == "HTML"
+    assert text.startswith("<b>Текущие оценки</b>\n\n")
+    assert ">Алгебра. Лист1</a>" in text
+    assert ">Алгебра. Лист3</a>" in text
+    assert "Модуль 1 — Что-то 2: 2" in text
+    assert "Модуль 1 — Что-то 1: 1" in text
+    assert "Модуль 1 →" not in text
+    assert text.index("Алгебра. Лист1") < text.index("Алгебра. Лист3")
 
 
 @pytest.mark.parametrize("command,user_id,state_name", [

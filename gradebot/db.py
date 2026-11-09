@@ -514,6 +514,21 @@ class Database:
         rows = self.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
         return str(rows[0]["rows"]) if rows else None
 
+    def grade_display_title(self, title: str, url: str) -> str:
+        """Show a workbook title and its tab name without changing stored sheet titles."""
+        if " · " in title:
+            return title.replace(" · ", ". ")
+        watched = self.all("SELECT tabs FROM workbook_watch WHERE url=?", (workbook_url(url),))
+        if not watched:
+            return title
+        tabs = json.loads(watched[0]["tabs"])
+        if len(tabs) < 2:
+            return title
+        for tab in tabs:
+            if sheet_url(tab["url"]) == sheet_url(url):
+                return f"{title}. {tab['name']}"
+        return title
+
     def view(self, view_id: str) -> sqlite3.Row | None:
         """Return a saved pagination view."""
         rows = self.all("SELECT * FROM views WHERE id=?", (view_id,))
