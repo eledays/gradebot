@@ -62,7 +62,7 @@ async def test_failed_refresh_preserves_cache_and_its_timestamp(db):
 
 
 @pytest.mark.parametrize("changed", [{2, 3, 4}, {4}, {3}, set()])
-async def test_notification_groups_changed_tabs_under_subject(db, changed):
+async def test_notification_lists_changed_tabs_individually(db, changed):
     specifications = [
         ("Алгебра · Семинары 1 модуль", "algebra", 0),
         ("Другой предмет · Лист1", "other", 0),
@@ -85,14 +85,13 @@ async def test_notification_groups_changed_tabs_under_subject(db, changed):
         monitor.bot.send_message.assert_not_called()
         return
     lines = ["<b>Найдены новые оценки</b>", ""]
-    if changed & {2, 4}:
-        lines.append("<b>Алгебра</b>")
-        if 2 in changed:
-            lines.extend(["Семинары 1 модуль", "- С1: 9,5", ""])
-        if 4 in changed:
-            lines.extend(["Итоги I семестр", "- С1: 9,5", ""])
-    if 3 in changed:
-        lines.extend(["<b>Другой предмет</b>", "Лист1", "- С1: 9,5", ""])
+    for sheet_id, title in [
+        (2, "Алгебра. Семинары 1 модуль"),
+        (3, "Другой предмет. Лист1"),
+        (4, "Алгебра. Итоги I семестр"),
+    ]:
+        if sheet_id in changed:
+            lines.extend([f"<b>{title}</b>", "- С1: 9,5", ""])
     assert result["notifications"] == 1
     monitor.bot.send_message.assert_awaited_once()
     assert monitor.bot.send_message.await_args.args[1] == "\n".join(lines)
@@ -100,7 +99,7 @@ async def test_notification_groups_changed_tabs_under_subject(db, changed):
     assert (await monitor.scan())["notifications"] == 0
 
 
-async def test_notification_subject_groups_are_by_file_and_escape_html(db):
+async def test_notification_sheet_titles_escape_html_without_grouping(db):
     monitor = Monitor(db, None, AsyncMock())
     for gid, leaf in enumerate(["Лист <1>", "Лист &2"]):
         db.add_sheet(f"Предмет <&> · {leaf}", f"https://docs.google.com/spreadsheets/d/book{gid}/edit",
@@ -109,9 +108,9 @@ async def test_notification_subject_groups_are_by_file_and_escape_html(db):
     monitor.fetch = AsyncMock(return_value=parsed("4"))
     await monitor.scan()
     text = monitor.bot.send_message.await_args.args[1]
-    assert text.count("<b>Предмет &lt;&amp;&gt;</b>") == 2
-    assert "Лист &lt;1&gt;\n- С1: 4" in text
-    assert "Лист &amp;2\n- С1: 4" in text
+    assert "<b>Предмет &lt;&amp;&gt;. Лист &lt;1&gt;</b>\n- С1: 4" in text
+    assert "<b>Предмет &lt;&amp;&gt;. Лист &amp;2</b>\n- С1: 4" in text
+    assert "Листы одной таблицы" not in text
 
 
 async def test_one_notification_per_user_across_subjects(db):

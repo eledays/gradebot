@@ -42,6 +42,8 @@ async def test_new_tabs_are_reported_once_and_discovery_is_per_workbook(setup):
     alerts = db.all("SELECT * FROM outbox WHERE kind='structure'")
     assert len(alerts) == 1 and alerts[0]["user_id"] == 999
     assert "Новый лист &lt;2&gt;" in alerts[0]["text"]
+    assert "/addtab" in alerts[0]["text"]
+    assert "через /add" not in alerts[0]["text"].replace("/addtab", "")
     await monitor.scan()
     assert len(db.all("SELECT * FROM outbox WHERE kind='structure'")) == 1
 
@@ -69,6 +71,7 @@ async def test_header_edit_compared_with_existing_cache_on_first_scan(setup):
     assert result["structure_notifications"] == 1
     text = db.all("SELECT text FROM outbox WHERE kind='structure'")[0]["text"]
     assert "Изменилась структура листа" in text and "Изменились заголовки" in text
+    assert "/addtab" in text
     assert (await monitor.scan())["structure_notifications"] == 0
 
 

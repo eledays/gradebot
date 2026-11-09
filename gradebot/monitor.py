@@ -16,12 +16,11 @@ from aiogram.types import LinkPreviewOptions
 
 from .db import Database
 from .logging_setup import audit
+from .messages import messages
 from .presentation import bold, paginate, safe_lines, table_link, view_markup
 from .sheets import Sheet, discover_sheets, fetch_sheet
 from .structure import (
-    group_sheets,
     header_signature,
-    sheet_group_title,
     structure_message,
     workbook_changes,
     workbook_url,
@@ -275,7 +274,7 @@ class Monitor:
                         if changes and self.db.admin_id() is not None:
                             self.db.queue(self.db.admin_id(), [bold("Изменились листы Google-таблицы"),
                                           table_link("Открыть таблицу", url + "/edit"), *changes,
-                                          "Нужные новые листы можно добавить через /add"],
+                                          messages.render("structure.new_tabs")],
                                           kind="structure", admin=True)
                             structure_notifications += 1
                     self.db.conn.execute(
@@ -321,20 +320,13 @@ class Monitor:
                             "ON CONFLICT(user_id,sheet_id) DO UPDATE SET grades=excluded.grades",
                             (user["id"], sheet["id"], json.dumps(grades)),
                         )
-                    for group in group_sheets(sorted(active.values(), key=lambda sheet: sheet["id"])):
-                        changed = [sheet for sheet in group if sheet["id"] in changes]
-                        if not changed:
+                    for sheet in sorted(active.values(), key=lambda item: item["id"]):
+                        if sheet["id"] not in changes:
                             continue
-                        subject = sheet_group_title(group)
-                        prefix = subject + " · " if subject else ""
-                        if subject or len(group) > 1:
-                            lines.append(bold(subject or "Листы одной таблицы"))
-                        for sheet in changed:
-                            title = sheet["title"].removeprefix(prefix)
-                            lines.extend(safe_lines(title) if subject or len(group) > 1 else [bold(title)])
-                            for column, value in changes[sheet["id"]]:
-                                lines.extend(safe_lines(f"- {column}: {value}"))
-                            lines.append("")
+                        lines.append(bold(sheet["title"].replace(" · ", ". ")))
+                        for column, value in changes[sheet["id"]]:
+                            lines.extend(safe_lines(f"- {column}: {value}"))
+                        lines.append("")
                     if len(lines) > 2 and user["notifications"]:
                         self.db.queue(user["telegram_id"], lines)
                         notifications += 1

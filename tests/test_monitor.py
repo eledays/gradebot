@@ -42,6 +42,26 @@ async def test_registration_baseline_new_column_and_edit(db):
     assert bot.send_message.await_count == 1
 
 
+async def test_grade_notification_lists_each_sheet_with_full_title(db):
+    base = "https://docs.google.com/spreadsheets/d/book/edit#gid="
+    db.add_sheet("Матан · Семинары", base + "1", 1, (1,), 123, "approved")
+    db.add_sheet("Матан · Экзамен", base + "2", 1, (1,), 123, "approved")
+    db.add_sheet("Физика", "https://docs.google.com/spreadsheets/d/other/edit#gid=0",
+                 1, (1,), 123, "approved")
+    for sheet in db.sheets_by_status("approved"):
+        db.snapshot(123, sheet["id"], {"С1": "5"}, [])
+    bot = AsyncMock()
+    monitor = Monitor(db, None, bot)
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+    await monitor.scan()
+    text = bot.send_message.await_args.args[1]
+    assert "Листы одной таблицы" not in text
+    assert "<b>Матан. Семинары</b>\n- С1: 4" in text
+    assert "<b>Матан. Экзамен</b>\n- С1: 4" in text
+    assert "<b>Физика</b>\n- С1: 4" in text
+    assert text.index("Матан. Семинары") < text.index("Матан. Экзамен") < text.index("Физика")
+
+
 async def test_delivery_retried_after_database_reopen(db):
     monitor = Monitor(db, None, AsyncMock())
     monitor.fetch = AsyncMock(return_value=parsed())

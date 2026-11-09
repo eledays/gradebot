@@ -4,6 +4,7 @@ import sqlite3
 from collections.abc import Mapping, Sequence
 from typing import TypeVar
 
+from .messages import messages
 from .presentation import bold, safe_lines, table_link
 from .sheets import SheetError, detect_layout, sheet_url
 
@@ -82,5 +83,5 @@ def structure_message(sheet: SheetRow, old: dict[str, object] | None,
         lines.append("Изменилось расположение ФИО или строк заголовков")
     if invalid:
         lines.append("Текущие настройки больше не позволяют прочитать лист. Сохранён предыдущий кэш")
-    lines.append("Проверьте настройки парсинга. Для повторной настройки удалите лист через /remove и добавьте через /add")
+    lines.append(messages.render("structure.reconfigure"))
     return lines
