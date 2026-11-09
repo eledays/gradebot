@@ -329,9 +329,10 @@ async def test_legacy_user_without_access_is_still_excluded(db):
     monitor.bot.send_message.assert_not_called()
 
 
-def test_new_table_announcement_includes_admin_without_member_entry(db):
+def test_new_sheet_announcement_includes_admin_without_member_entry(db):
     db.execute("INSERT INTO settings VALUES('admin','123')")
     db.execute("DELETE FROM members WHERE id=123")
     with db.conn:
         db.broadcast_table("Алгебра", "https://docs.google.com/spreadsheets/d/algebra/edit#gid=0")
     assert [r["user_id"] for r in db.all("SELECT user_id FROM outbox WHERE kind='table'")] == [123]
+    assert "Добавлен новый лист" in db.all("SELECT text FROM outbox WHERE kind='table'")[0]["text"]

@@ -222,7 +222,7 @@ def test_legacy_self_registered_users_do_not_receive_access(tmp_path):
         db.close()
 
 
-async def test_admin_can_delete_table_by_id_with_confirmation(app):
+async def test_deleting_last_sheet_offers_to_remove_or_keep_workbook(app):
     sheet_id = app.db.add_sheet(
         "Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved"
     )
@@ -235,8 +235,97 @@ async def test_admin_can_delete_table_by_id_with_confirmation(app):
     data = await app.context().get_data()
     await app.click(f"remove:{data['token']}")
     assert not app.db.all("SELECT * FROM sheets")
+    assert app.db.all("SELECT * FROM workbooks")
+    assert "Последний лист удалён" in app.replies()[-1]
+    data = await app.context().get_data()
+    await app.click(f"dismiss:{data['token']}")
+    assert "Таблица оставлена" in app.replies()[-1]
+    assert app.db.all("SELECT * FROM workbooks")
+    await app.send("/addtab")
+    assert "#1: Матан" in app.replies()[-1]
     await app.send("Удалить лист")
-    assert app.replies()[-1] == "Таблиц пока нет"
+    assert app.replies()[-1] == "Листов пока нет"
+
+
+async def test_last_sheet_offer_can_remove_empty_workbook(app):
+    sheet_id = app.db.add_sheet(
+        "Матан", "https://docs.google.com/spreadsheets/d/id/edit", 1, (1,), 999, "approved"
+    )
+    await app.send("/remove")
+    await app.send(str(sheet_id))
+    data = await app.context().get_data()
+    await app.click(f"remove:{data['token']}")
+    data = await app.context().get_data()
+    await app.click(f"remove_table:{data['token']}")
+    assert not app.db.all("SELECT * FROM sheets")
+    assert not app.db.all("SELECT * FROM workbooks")
+    assert "Таблица удалена" in app.replies()[-1]
+
+
+async def test_remove_table_deletes_all_its_sheets_and_related_rows(app):
+    app.db.register(123, "Иванов Иван")
+    base = "https://docs.google.com/spreadsheets/d/algebra/edit#gid="
+    first = app.db.add_sheet("Алгебра & КР · Первый", base + "1", 1, (1,), 999, "approved",
+                             parsed=Sheet([["ФИО", "Оценка"], ["Иванов Иван", "5"]]))
+    second = app.db.add_sheet("Алгебра & КР · Второй", base + "2", 1, (1,), 999, "approved")
+    other = app.db.add_sheet("История", "https://docs.google.com/spreadsheets/d/history/edit",
+                             1, (1,), 999, "approved")
+    workbook_id = app.db.all("SELECT workbook_id FROM sheets WHERE id=?", (first,))[0][0]
+    app.db.snapshot(123, first, {"Оценка": "5"}, [])
+    with app.db.conn:
+        app.db.remember_workbook(base + "1", [
+            {"name": "Первый", "url": base + "1"}, {"name": "Второй", "url": base + "2"}
+        ])
+    await app.send("/removetable")
+    preview = app.replies()[-1]
+    assert f"#{workbook_id}: Алгебра &amp; КР" in preview
+    assert "Первый" not in preview and "Второй" not in preview
+    await app.send(str(workbook_id))
+    prompt = app.bot.session.await_args.args[1]
+    assert prompt.parse_mode == "HTML"
+    assert "Алгебра &amp; КР" in prompt.text and "листов: 2" in prompt.text
+    data = await app.context().get_data()
+    await app.click(f"remove_table:{data['token']}")
+    assert not app.db.all("SELECT * FROM workbooks WHERE id=?", (workbook_id,))
+    assert not app.db.all("SELECT * FROM sheets WHERE id IN (?,?)", (first, second))
+    assert app.db.all("SELECT id FROM sheets WHERE id=?", (other,))
+    assert not app.db.all("SELECT * FROM snapshots WHERE sheet_id=?", (first,))
+    assert not app.db.all("SELECT * FROM sheet_cache WHERE sheet_id=?", (first,))
+    assert not app.db.all("SELECT * FROM workbook_watch WHERE url LIKE '%algebra%'")
+    assert app.db.all("PRAGMA foreign_key_check") == []
+    assert app.replies()[-1] == "Таблица удалена. Удалено листов: 2"
+
+
+async def test_remove_table_confirmation_rejects_changed_sheet_set(app):
+    first = app.db.add_sheet("Матан", "https://docs.google.com/spreadsheets/d/book/edit#gid=1",
+                             1, (1,), 999, "approved")
+    workbook_id = app.db.all("SELECT workbook_id FROM sheets WHERE id=?", (first,))[0][0]
+    await app.send("/removetable")
+    await app.send(str(workbook_id))
+    data = await app.context().get_data()
+    app.db.add_sheet("Матан · Второй", "https://docs.google.com/spreadsheets/d/book/edit#gid=2",
+                     1, (1,), 999, "approved")
+    await app.click(f"remove_table:{data['token']}")
+    assert "Состав таблицы изменился" in app.replies()[-1]
+    assert len(app.db.all("SELECT id FROM sheets WHERE workbook_id=?", (workbook_id,))) == 2
+    assert app.db.all("SELECT id FROM workbooks WHERE id=?", (workbook_id,))
+
+
+async def test_removing_one_of_two_sheets_keeps_workbook_without_offer(app):
+    first = app.db.add_sheet("Алгебра · Первый",
+                             "https://docs.google.com/spreadsheets/d/book/edit#gid=1",
+                             1, (1,), 999, "approved")
+    second = app.db.add_sheet("Алгебра · Второй",
+                              "https://docs.google.com/spreadsheets/d/book/edit#gid=2",
+                              1, (1,), 999, "approved")
+    await app.send("/remove")
+    await app.send(str(first))
+    data = await app.context().get_data()
+    await app.click(f"remove:{data['token']}")
+    assert app.replies()[-1] == "Лист удалён"
+    assert await app.state() is None
+    assert app.db.all("SELECT id FROM sheets WHERE id=?", (second,))
+    assert app.db.all("SELECT id FROM workbooks")
 
 
 async def test_admin_can_revoke_by_id_and_outsider_cannot(app):

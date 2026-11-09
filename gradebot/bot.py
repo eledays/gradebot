@@ -86,6 +86,7 @@ class Dialog(StatesGroup):
     revoke = State()
     revoke_confirm = State()
     remove_confirm = State()
+    remove_table_confirm = State()
     title = State()
     link = State()
     sheet_selection = State()
@@ -98,12 +99,13 @@ class Dialog(StatesGroup):
     subject_id = State()
     addtab_id = State()
     remove = State()
+    remove_table_id = State()
 
 
 def registration_summary(reports: list[GradeReport]) -> str:
     """Summarize missing, ambiguous, and unavailable grade reports."""
     if not reports:
-        return "Таблиц пока нет"
+        return messages.render("replies.no_sheets")
     missing = [r["title"] for r in reports if r["status"] == "missing"]
     ambiguous = [r["title"] for r in reports if r["status"] == "ambiguous"]
     unavailable = [r["title"] for r in reports if r["status"] == "unavailable"]
@@ -111,11 +113,11 @@ def registration_summary(reports: list[GradeReport]) -> str:
         return ""
     lines = []
     if missing or ambiguous:
-        lines.append("Не смог тебя найти в таблицах:")
+        lines.append(messages.render("replies.registration_missing_sheets"))
         lines.extend(f"- {title}" for title in missing)
         lines.extend(f"- {title} — несколько совпадений ФИО" for title in ambiguous)
     if unavailable:
-        lines.append("Не удалось проверить таблицы:")
+        lines.append(messages.render("replies.registration_unavailable_sheets"))
         lines.extend(f"• {title}" for title in unavailable)
     return "\n".join(lines)
 
@@ -124,7 +126,7 @@ def parse_spec(text: str) -> tuple[str, str, int, tuple[int, ...]]:
     """Parse a manually entered sheet specification."""
     pieces = [part.strip() for part in text.split("|")]
     if len(pieces) not in (2, 3, 4) or not pieces[0] or len(pieces[0]) > 200:
-        raise SheetError("Формат: Предмет | ссылка | строка заголовков | столбцы ФИО")
+        raise SheetError("Формат: Название таблицы | ссылка | строка заголовков | столбцы ФИО")
     url = export_url(pieces[1])
     try:
         header = int(pieces[2]) if len(pieces) > 2 else 1
@@ -157,8 +159,9 @@ def menu(admin: bool = False) -> ReplyKeyboardMarkup:
                 ["Пользователи", "Создать ссылку"],
                 ["Добавить таблицу", "Добавить лист"],
                 ["Предложения"],
-                ["Обновить", "Удалить лист"],
-                ["Столбцы", "Заблокировать"],
+                ["Обновить", "Столбцы"],
+                ["Удалить лист", "Удалить таблицу"],
+                ["Заблокировать"],
             ]
         )
     return ReplyKeyboardMarkup(
@@ -234,9 +237,10 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             lines.extend(safe_lines(f"#{row['id']}: {db.grade_display_title(row['title'], row['url'])}"))
         await send_view(message, db, lines)
 
-    async def show_workbook_id_prompt(message: Message, rows: Sequence[ExtensionWorkbook]) -> None:
+    async def show_workbook_id_prompt(message: Message, rows: Sequence[ExtensionWorkbook | sqlite3.Row],
+                                      prompt_key: str) -> None:
         """Show one compact choice per existing Google workbook."""
-        lines = [messages.render("replies.add_tab_prompt"), ""]
+        lines = [messages.render(prompt_key), ""]
         for row in rows:
             lines.extend(safe_lines(f"#{row['id']}: {row['title']}"))
         await send_view(message, db, lines)
@@ -429,7 +433,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
                 "fetched_at": min(timestamps) if len(timestamps) == len(reports) else None,
                 "stale": any(r["stale"] for r in reports),
             }))
-        await send_view(message, db, lines if reports else ["Таблиц пока нет"])
+        await send_view(message, db, lines if reports else [messages.render("replies.no_sheets")])
 
     @router.message(Command("subject"))
     async def subject_command(message: Message, state: FSMContext) -> None:
@@ -516,7 +520,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             if timestamps and len(timestamps) != len(group):
                 lines.append("Кэш загружен не для всех листов")
             lines.append("")
-        await send_view(message, db, lines if rows else ["Таблиц пока нет"])
+        await send_view(message, db, lines if rows else [messages.render("replies.no_sheets")])
 
     @router.message(F.text == "Столбцы")
     @router.message(Command("columns"))
@@ -691,7 +695,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await message.answer(messages.render("replies.add_tab_empty"))
             return
         await state.set_state(Dialog.addtab_id)
-        await show_workbook_id_prompt(message, workbooks)
+        await show_workbook_id_prompt(message, workbooks, "replies.add_tab_prompt")
 
     @router.message(Dialog.addtab_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
     async def add_tab_id(message: Message, state: FSMContext) -> None:
@@ -769,7 +773,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         except Exception:
             await message.answer(messages.render("replies.refresh_3"))
             return
-        lines = [bold("Обновление кэша завершено"), f"Обновлено таблиц: {result['updated']}"]
+        lines = [bold("Обновление кэша завершено"),
+                 messages.render("replies.refresh_count", count=result["updated"])]
         if result["failed"]:
             lines.extend(["", "Не удалось обновить:"])
             for title in result["failed"]:
@@ -899,7 +904,6 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await monitor.deliver()
 
     @router.message(F.text == "Удалить лист")
-    @router.message(F.text == "Удалить таблицу")
     @router.message(Command("remove"))
     async def remove(message: Message, state: FSMContext) -> None:
         """Handle the remove interaction."""
@@ -913,6 +917,21 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         await state.set_state(Dialog.remove)
         await show_sheet_id_prompt(message, "replies.remove_prompt", rows)
+
+    @router.message(F.text == "Удалить таблицу")
+    @router.message(Command("removetable"))
+    async def remove_table(message: Message, state: FSMContext) -> None:
+        """Ask for the ID of a workbook to remove with all its sheets."""
+        if message.from_user.id != db.admin_id():
+            await message.answer(messages.render("replies.remove_1"))
+            return
+        await state.clear()
+        workbooks = db.workbooks_for_removal()
+        if not workbooks:
+            await message.answer(messages.render("replies.remove_table_empty"))
+            return
+        await state.set_state(Dialog.remove_table_id)
+        await show_workbook_id_prompt(message, workbooks, "replies.remove_table_prompt")
 
     @router.message(F.text == "Пользователи")
     @router.message(Command("members"))
@@ -1019,9 +1038,9 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             reply_markup=confirmation("revoke", token, "Заблокировать"),
         )
 
-    @router.callback_query(F.data.regexp(r"^(remove|revoke|dismiss):[a-f0-9]{16}$"))
+    @router.callback_query(F.data.regexp(r"^(remove|remove_table|revoke|dismiss):[a-f0-9]{16}$"))
     async def confirm(callback: CallbackQuery, state: FSMContext) -> None:
-        """Handle the confirm interaction."""
+        """Apply a token-scoped deletion or member block."""
         if callback.from_user.id != db.admin_id():
             await callback.answer(messages.render("replies.confirm_1"), show_alert=True)
             return
@@ -1029,31 +1048,44 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         data = await state.get_data()
         states = {
             "remove": Dialog.remove_confirm.state,
+            "remove_table": Dialog.remove_table_confirm.state,
             "revoke": Dialog.revoke_confirm.state,
         }
         current = await state.get_state()
         if data.get("token") != token or (action != "dismiss" and states[action] != current):
             await callback.answer(messages.render("replies.confirm_2"), show_alert=True)
             return
+        offer_empty_table = None
         if action == "dismiss":
-            result = "Отменил"
+            result = messages.render("replies.remove_table_kept" if data.get("after_last_sheet")
+                                     else "replies.confirm_dismissed")
         else:
             async with monitor.lock:
                 if action == "remove":
-                    deleted = db.remove_approved_sheet(data["sheet_id"])
-                    result = "Таблица удалена" if deleted else "Таблица уже удалена"
-                    audit("sheet_removed", sheet_id=data["sheet_id"], count=deleted)
+                    removed = db.remove_approved_sheet(data["sheet_id"])
+                    result = messages.render("replies.remove_sheet_done" if removed
+                                             else "replies.remove_sheet_stale")
+                    if removed and removed["workbook_empty"]:
+                        offer_empty_table = removed["workbook_id"]
+                    audit("sheet_removed", sheet_id=data["sheet_id"], count=bool(removed))
+                elif action == "remove_table":
+                    deleted = db.remove_workbook(data["workbook_id"], data["expected_sheet_ids"])
+                    result = (messages.render("replies.remove_table_done", count=deleted)
+                              if deleted is not None else messages.render("replies.remove_table_stale"))
+                    audit("workbook_removed", workbook_id=data["workbook_id"], count=deleted or 0)
                 else:
                     if data["member_id"] == db.admin_id():
                         await callback.answer(messages.render("replies.confirm_3"), show_alert=True)
                         return
                     db.block(data["member_id"])
-                    result = "Пользователь заблокирован"
+                    result = messages.render("replies.revoke_done")
         await state.clear()
         await callback.answer()
         if isinstance(callback.message, Message):
             await callback.message.edit_reply_markup(reply_markup=None)
             await callback.message.answer(result, reply_markup=menu(True))
+            if offer_empty_table is not None:
+                await ask_remove_table(callback.message, state, offer_empty_table, after_last_sheet=True)
 
     async def setup_view(message: Message, lines: Sequence[str]) -> None:
         """Send a paginated administrator setup view."""
@@ -1595,9 +1627,46 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             return
         await ask_remove(message, state, sheet_id)
 
+    @router.message(Dialog.remove_table_id, F.text, ~F.text.startswith("/"), ~F.text.in_(menu_labels))
+    async def remove_table_id(message: Message, state: FSMContext) -> None:
+        """Load one workbook for a full-deletion confirmation."""
+        if message.from_user.id != db.admin_id():
+            await state.clear()
+            await message.answer(messages.render("replies.remove_1"))
+            return
+        try:
+            workbook_id = int(message.text.strip())
+            if not 0 < workbook_id < 2**63:
+                raise ValueError
+        except ValueError:
+            await message.answer(messages.render("replies.remove_table_id_invalid"))
+            return
+        await ask_remove_table(message, state, workbook_id)
+
+    async def ask_remove_table(message: Message, state: FSMContext, workbook_id: int, *,
+                               after_last_sheet: bool = False) -> None:
+        """Confirm removal of one workbook against its current sheet set."""
+        workbook = db.workbook_for_removal(workbook_id)
+        if workbook is None:
+            if not after_last_sheet:
+                await message.answer(messages.render("replies.remove_table_missing"))
+            return
+        if after_last_sheet and workbook["sheet_ids"]:
+            return
+        token = secrets.token_hex(8)
+        await state.clear()
+        await state.update_data(workbook_id=workbook_id, expected_sheet_ids=workbook["sheet_ids"],
+                                after_last_sheet=after_last_sheet, token=token)
+        await state.set_state(Dialog.remove_table_confirm)
+        text = (messages.render("replies.remove_table_after_last", title=workbook["title"])
+                if after_last_sheet else messages.render("replies.remove_table_confirm",
+                                                       title=workbook["title"], count=len(workbook["sheet_ids"])))
+        await message.answer(text, parse_mode="HTML",
+                             reply_markup=confirmation("remove_table", token, "Удалить таблицу"))
+
     async def ask_remove(message: Message, state: FSMContext, sheet_id: int) -> None:
         """Ask for confirmation before removing a sheet."""
-        sheet = db.sheet(sheet_id, "approved")
+        sheet = db.approved_sheet_with_workbook(sheet_id)
         if sheet is None:
             await message.answer(messages.render("replies.ask_remove_1"))
             return
@@ -1605,7 +1674,8 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         await state.update_data(sheet_id=sheet_id, token=token)
         await state.set_state(Dialog.remove_confirm)
         await message.answer(
-            messages.render("replies.ask_remove_confirm", title=sheet["title"]),
+            messages.render("replies.ask_remove_confirm", tab_name=sheet["tab_name"],
+                            workbook_title=sheet["workbook_title"]),
             parse_mode="HTML",
             reply_markup=confirmation("remove", token, "Удалить"),
         )
@@ -1631,12 +1701,14 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         """Handle the text message interaction."""
         current = await state.get_state()
         prompts = {
-            Dialog.title.state: "Жду название предмета",
+            Dialog.title.state: messages.render("replies.add_title_waiting"),
             Dialog.link.state: "Жду ссылку на таблицу",
             Dialog.remove.state: messages.render("replies.remove_id_waiting"),
+            Dialog.remove_table_id.state: messages.render("replies.remove_table_id_waiting"),
             Dialog.addtab_id.state: messages.render("replies.add_tab_id_waiting"),
             Dialog.requested_name.state: "Введи новое ФИО",
             Dialog.remove_confirm.state: "Жду подтверждение",
+            Dialog.remove_table_confirm.state: "Жду подтверждение",
             Dialog.revoke.state: "Отправь ID пользователя из /members",
             Dialog.columns_id.state: messages.render("replies.columns_id_waiting"),
             Dialog.subject_id.state: messages.render("replies.subject_id_waiting"),

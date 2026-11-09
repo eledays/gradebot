@@ -19,6 +19,7 @@ EVENTS = frozenset(
         "access_denied",
         "handler_failed",
         "sheet_removed",
+        "workbook_removed",
         "refresh_started",
         "refresh_finished",
         "refresh_failed",
@@ -43,6 +44,7 @@ EVENTS = frozenset(
 NUMBERS = frozenset(
     {
         "sheet_id",
+        "workbook_id",
         "notification_id",
         "updated",
         "failed",

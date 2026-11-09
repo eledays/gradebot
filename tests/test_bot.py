@@ -32,7 +32,8 @@ async def test_non_admin_cannot_add_or_remove(tmp_path):
         monitor.fetch = AsyncMock(return_value=Sheet([["ФИО", "С1"], ["Иванов Иван", "5"]]))
         dispatcher = Dispatcher()
         dispatcher.include_router(create_router(db, monitor))
-        for text in ["/add Матан | https://docs.google.com/spreadsheets/d/id/edit", "/remove 1", "/pending"]:
+        for text in ["/add Матан | https://docs.google.com/spreadsheets/d/id/edit", "/remove 1",
+                     "/removetable", "/pending"]:
             message = Message(
                 message_id=1,
                 date=datetime.now(UTC),
@@ -42,7 +43,7 @@ async def test_non_admin_cannot_add_or_remove(tmp_path):
             )
             await dispatcher.feed_update(bot, Update(update_id=1, message=message))
         assert not db.all("SELECT * FROM sheets")
-        assert bot.session.await_count == 3
+        assert bot.session.await_count == 4
         monitor.fetch.assert_not_called()
     finally:
         db.close()
@@ -289,7 +290,7 @@ async def test_dialogs_are_isolated_between_users(dialog_bot):
     ]
 
 
-async def test_remove_retries_unknown_id_then_clears_state(dialog_bot):
+async def test_remove_retries_unknown_id_then_offers_empty_workbook_removal(dialog_bot):
     from gradebot.bot import Dialog
 
     h = dialog_bot
@@ -307,7 +308,7 @@ async def test_remove_retries_unknown_id_then_clears_state(dialog_bot):
     context = h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999)
     data = await context.get_data()
     await h.callback(f"remove:{data['token']}")
-    assert await h.state(999) is None
+    assert await h.state(999) == Dialog.remove_table_confirm.state
     assert not h.db.all("SELECT * FROM sheets")
 
 
@@ -356,7 +357,7 @@ def test_registration_summary_distinguishes_unavailable_from_missing():
     summary = registration_summary([{"title": "Матан", "status": "unavailable"}])
     assert "Не удалось проверить" in summary
     assert "ФИО не найдено" not in summary
-    assert "Таблиц пока нет" in registration_summary([])
+    assert "Листов пока нет" in registration_summary([])
 
 
 async def test_grades_and_tables_each_send_one_cached_message(dialog_bot):
@@ -545,7 +546,7 @@ async def test_id_commands_with_no_sheets_do_not_wait_for_input(dialog_bot, comm
     h = dialog_bot
     h.db.activate(123)
     await h.send(command, user_id)
-    assert h.replies()[-1] == "Таблиц пока нет"
+    assert h.replies()[-1] == "Листов пока нет"
     assert await h.state(user_id) is None
 
 
@@ -838,7 +839,7 @@ async def test_refresh_is_admin_only_and_reports_failures(dialog_bot):
     assert "/refresh" not in h.replies()[-1]
     await h.send("/refresh", 999)
     h.monitor.scan.assert_awaited_once()
-    assert "Обновлено таблиц: 2" in h.replies()[-1]
+    assert "Обновлено листов: 2" in h.replies()[-1]
     assert "- История" in h.replies()[-1]
     assert "Уведомлений об изменениях: 1" in h.replies()[-1]
     await h.send("/help", 999)
@@ -933,7 +934,7 @@ async def test_subject_grades_pagination_is_owned_and_handles_deleted_sheet(dial
     assert pages[1] in h.replies()
     h.db.execute("DELETE FROM sheets WHERE id=?", (sheet_id,))
     await h.callback(f"subject:{sheet_id}", 123)
-    assert h.bot.session.await_args.args[1].text == "Таблица больше недоступна"
+    assert h.bot.session.await_args.args[1].text == "Лист больше недоступен"
 
 
 async def setup_data(h):
@@ -952,7 +953,7 @@ async def test_saved_columns_buttons_save_cancel_and_reject_stale_callbacks(dial
     await h.send("не число", 999)
     assert "числовой ID" in h.replies()[-1]
     await h.send("9999", 999)
-    assert "Таблица больше недоступна" in h.replies()[-1]
+    assert "Лист больше недоступен" in h.replies()[-1]
     await h.send("1", 999)
     token = (await setup_data(h))["column_token"]
     await h.callback(f"colpick:{token}:3")
@@ -996,7 +997,7 @@ async def test_columns_are_admin_only_and_require_cached_approved_sheet(dialog_b
     await h.callback(f"colpick:{token}:done")
     assert "больше недоступны" in h.replies()[-1]
     await h.callback("pick_columns:1")
-    assert h.replies()[-1] == "Таблица больше недоступна"
+    assert h.replies()[-1] == "Лист больше недоступен"
 
 
 async def test_setup_column_picker_paging_and_save(dialog_bot, monkeypatch):

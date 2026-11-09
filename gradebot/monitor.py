@@ -94,7 +94,7 @@ def format_grades(report: GradeReport, *, limit: int | None = 3,
             {
                 "missing": "ФИО не найдено",
                 "ambiguous": "Несколько совпадений ФИО",
-                "unavailable": "Таблица ещё не загружена",
+                "unavailable": messages.render("replies.grades_sheet_unavailable"),
             }[report["status"]]
         )
     if include_caption:

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import NotRequired, TypedDict
 
 from .logging_setup import audit
+from .messages import TrustedHtml, messages
 from .presentation import bold, create_view, table_link
 from .schema import initialize_database
 from .sheets import Sheet, SheetError, sheet_url
@@ -53,6 +54,22 @@ class ExtensionWorkbook(TypedDict):
     title: str
     url: str
     existing_urls: list[str]
+
+
+class WorkbookRemoval(TypedDict):
+    """A workbook and the exact set of sheets awaiting deletion."""
+
+    id: int
+    title: str
+    sheet_ids: list[int]
+
+
+class RemovedSheet(TypedDict):
+    """The parent workbook left after removing an approved sheet."""
+
+    workbook_id: int
+    workbook_title: str
+    workbook_empty: bool
 
 
 class DuplicateTitleError(ValueError):
@@ -371,7 +388,7 @@ class Database:
             sheets = self.all("SELECT * FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
             caches = self.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
             if not sheets or not caches:
-                raise SheetError("Таблица или её кэш больше недоступны. Открой /columns заново")
+                raise SheetError(messages.render("replies.columns_sheet_unavailable"))
             sheet = sheets[0]
             options = json.loads(sheet["parser_options"])
             rows = json.loads(caches[0]["rows"])
@@ -450,17 +467,20 @@ class Database:
             )
 
     def extension_workbooks(self) -> list[ExtensionWorkbook]:
-        """List parent workbooks that contain at least one approved tab."""
+        """List approved and empty workbooks that can accept new tabs."""
         return [self._extension_group(row) for row in self.all(
             "SELECT w.* FROM workbooks w WHERE EXISTS "
-            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved') ORDER BY w.id"
+            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved') "
+            "OR NOT EXISTS (SELECT 1 FROM sheets s WHERE s.workbook_id=w.id) "
+            "ORDER BY w.id"
         )]
 
     def extension_source(self, workbook_id: int) -> ExtensionWorkbook | None:
-        """Find an approved parent workbook by its own ID."""
+        """Find an approved or empty workbook by its own ID."""
         rows = self.all(
-            "SELECT w.* FROM workbooks w WHERE w.id=? AND EXISTS "
-            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved')",
+            "SELECT w.* FROM workbooks w WHERE w.id=? AND (EXISTS "
+            "(SELECT 1 FROM sheets s WHERE s.workbook_id=w.id AND s.status='approved') "
+            "OR NOT EXISTS (SELECT 1 FROM sheets s WHERE s.workbook_id=w.id))",
             (workbook_id,),
         )
         return self._extension_group(rows[0]) if rows else None
@@ -490,10 +510,13 @@ class Database:
         )
 
     def broadcast_table(self, title: str, url: str) -> None:
-        """Queue a new-table announcement for active users."""
+        """Queue a new-sheet announcement for active users."""
         for user in self.notification_users():
             self.queue(
-                user["telegram_id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
+                user["telegram_id"],
+                [messages.render("notifications.new_sheet",
+                                 sheet=TrustedHtml(table_link(self.grade_display_title(title, url), url)))],
+                kind="table",
             )
 
     def has_join_draft(self, user_id: int) -> bool:
@@ -597,9 +620,54 @@ class Database:
         """Return whether any non-admin members can be revoked."""
         return bool(self.all("SELECT id FROM members WHERE id!=?", (self.admin_id(),)))
 
-    def remove_approved_sheet(self, sheet_id: int) -> bool:
-        """Remove an approved sheet by ID."""
-        return bool(self.execute("DELETE FROM sheets WHERE id=? AND status='approved'", (sheet_id,)).rowcount)
+    def approved_sheet_with_workbook(self, sheet_id: int) -> sqlite3.Row | None:
+        """Return one approved sheet with its parent title for confirmation."""
+        rows = self.all(
+            "SELECT s.*,w.title AS workbook_title FROM sheets s "
+            "JOIN workbooks w ON w.id=s.workbook_id WHERE s.id=? AND s.status='approved'",
+            (sheet_id,),
+        )
+        return rows[0] if rows else None
+
+    def workbooks_for_removal(self) -> list[sqlite3.Row]:
+        """List all stored workbooks, including empty ones."""
+        return self.all("SELECT id,title FROM workbooks ORDER BY id")
+
+    def workbook_for_removal(self, workbook_id: int) -> WorkbookRemoval | None:
+        """Read a workbook and the precise set of its saved sheet IDs."""
+        rows = self.all("SELECT id,title FROM workbooks WHERE id=?", (workbook_id,))
+        if not rows:
+            return None
+        sheets = self.all("SELECT id FROM sheets WHERE workbook_id=? ORDER BY id", (workbook_id,))
+        return {"id": int(rows[0]["id"]), "title": str(rows[0]["title"]),
+                "sheet_ids": [int(row["id"]) for row in sheets]}
+
+    def remove_approved_sheet(self, sheet_id: int) -> RemovedSheet | None:
+        """Remove one approved sheet and report whether its parent became empty."""
+        with self.conn:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
+            sheet = self.approved_sheet_with_workbook(sheet_id)
+            if sheet is None:
+                return None
+            self.conn.execute("DELETE FROM sheets WHERE id=? AND status='approved'", (sheet_id,))
+            empty = not self.all("SELECT 1 FROM sheets WHERE workbook_id=?", (sheet["workbook_id"],))
+            return {"workbook_id": int(sheet["workbook_id"]),
+                    "workbook_title": str(sheet["workbook_title"]), "workbook_empty": empty}
+
+    def remove_workbook(self, workbook_id: int, expected_sheet_ids: Sequence[int]) -> int | None:
+        """Delete a workbook and all its sheets only if its contents are unchanged."""
+        with self.conn:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN IMMEDIATE")
+            workbook = self.workbook_for_removal(workbook_id)
+            if workbook is None or workbook["sheet_ids"] != list(expected_sheet_ids):
+                return None
+            self.conn.execute("DELETE FROM sheets WHERE workbook_id=?", (workbook_id,))
+            self.conn.execute("DELETE FROM workbook_watch WHERE url=(SELECT url FROM workbooks WHERE id=?)",
+                              (workbook_id,))
+            self.conn.execute("DELETE FROM workbooks WHERE id=?", (workbook_id,))
+            return len(workbook["sheet_ids"])
 
     def parser_options(self, sheet_id: int, status: str) -> str | None:
         """Return serialized parser options for a sheet in the given state."""
