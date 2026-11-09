@@ -31,6 +31,12 @@ class Database:
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS members(
           id INTEGER PRIMARY KEY, name TEXT NOT NULL, username TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS invitations(
+          token TEXT PRIMARY KEY, expires_at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS blocked_users(id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS registration_drafts(user_id INTEGER PRIMARY KEY, token TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS name_requests(
+          user_id INTEGER PRIMARY KEY, name TEXT NOT NULL, created_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS sheets(
           id INTEGER PRIMARY KEY, title TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
           header_row INTEGER NOT NULL, name_columns TEXT NOT NULL,
@@ -98,12 +104,69 @@ class Database:
         return int(row[0]) if row else None
 
     def register(self, user_id, name):
-        """Internal administrator/test helper. Telegram users never supply their own name."""
+        """Internal administrator/test helper."""
         self.grant_members([(user_id, "", name)])
         self.activate(user_id)
 
     def authorized(self, user_id):
         return user_id == self.admin_id() or bool(self.all("SELECT id FROM members WHERE id=?", (user_id,)))
+
+    def blocked(self, user_id):
+        return bool(self.all("SELECT 1 FROM blocked_users WHERE id=?", (user_id,)))
+
+    def create_invitation(self, lifetime=86400):
+        import secrets
+        token = secrets.token_urlsafe(24)
+        self.execute("INSERT INTO invitations VALUES(?,?)", (token, time.time() + lifetime))
+        return token
+
+    def invitation_valid(self, token):
+        return bool(self.all("SELECT 1 FROM invitations WHERE token=? AND expires_at>?", (token, time.time())))
+
+    def begin_join(self, user_id, token):
+        if self.blocked(user_id) or not self.invitation_valid(token):
+            return False
+        self.execute("INSERT INTO registration_drafts VALUES(?,?) ON CONFLICT(user_id) "
+                     "DO UPDATE SET token=excluded.token", (user_id, token))
+        return True
+
+    def join(self, user_id, username, name, token):
+        with self.conn:
+            if self.blocked(user_id) or not self.invitation_valid(token):
+                return False
+            self.conn.execute(
+                "INSERT INTO members(id,name,username) VALUES(?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET name=excluded.name,username=excluded.username",
+                (user_id, name, username or ""),
+            )
+            self._save_name(user_id, name)
+            self.conn.execute("DELETE FROM registration_drafts WHERE user_id=?", (user_id,))
+        return True
+
+    def change_name(self, user_id, name):
+        with self.conn:
+            result = self.conn.execute("UPDATE members SET name=? WHERE id=?", (name, user_id))
+            if result.rowcount:
+                self._save_name(user_id, name)
+                self.conn.execute("DELETE FROM name_requests WHERE user_id=?", (user_id,))
+        return bool(result.rowcount)
+
+    def request_name(self, user_id, name):
+        self.execute(
+            "INSERT INTO name_requests VALUES(?,?,?) ON CONFLICT(user_id) "
+            "DO UPDATE SET name=excluded.name,created_at=excluded.created_at",
+            (user_id, name, time.time()),
+        )
+
+    def block(self, user_id):
+        if user_id == self.admin_id():
+            return False
+        with self.conn:
+            self.conn.execute("INSERT OR IGNORE INTO blocked_users VALUES(?)", (user_id,))
+            self.revoke(user_id)
+            self.conn.execute("DELETE FROM name_requests WHERE user_id=?", (user_id,))
+            self.conn.execute("DELETE FROM registration_drafts WHERE user_id=?", (user_id,))
+        return True
 
     def grant_members(self, entries):
         count = 0
@@ -168,6 +231,8 @@ class Database:
     def cleanup(self):
         cutoff = time.time() - 30 * 86400
         with self.conn:
+            self.conn.execute("DELETE FROM invitations WHERE expires_at<?", (time.time(),))
+            self.conn.execute("DELETE FROM registration_drafts WHERE token NOT IN (SELECT token FROM invitations)")
             self.conn.execute("DELETE FROM outbox WHERE status!='pending' AND created_at<?", (cutoff,))
             self.conn.execute(
                 "DELETE FROM views WHERE created_at<? AND id NOT IN "
@@ -265,11 +330,15 @@ class Database:
         )
 
     def queue(self, user_id, lines, *, kind="grades", actions=None, admin=False):
-        view_id, pages = create_view(self, user_id, lines, admin=admin, actions=actions)
-        self.conn.execute(
-            "INSERT INTO outbox(user_id,text,view_id,kind,created_at) VALUES(?,?,?,?,?)",
-            (user_id, pages[0], view_id, kind, time.time()),
-        )
+        """Enqueue a notification and its view in the current transaction."""
+        with nullcontext() if self.conn.in_transaction else self.conn:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
+            view_id, pages = create_view(self, user_id, lines, admin=admin, actions=actions)
+            self.conn.execute(
+                "INSERT INTO outbox(user_id,text,view_id,kind,created_at) VALUES(?,?,?,?,?)",
+                (user_id, pages[0], view_id, kind, time.time()),
+            )
 
     def remember_workbook(self, url, tabs):
         from .structure import workbook_url
@@ -290,6 +359,157 @@ class Database:
             self.queue(
                 user["id"], [bold("Добавлена новая таблица"), "", table_link(title, url)], kind="table"
             )
+
+    def has_join_draft(self, user_id: int) -> bool:
+        """Return whether a user is entering a name through an invitation."""
+        return bool(self.all("SELECT 1 FROM registration_drafts WHERE user_id=?", (user_id,)))
+
+    def join_token(self, user_id: int) -> str | None:
+        """Return the pending invitation token for a user."""
+        rows = self.all("SELECT token FROM registration_drafts WHERE user_id=?", (user_id,))
+        return str(rows[0]["token"]) if rows else None
+
+    def discard_join_draft(self, user_id: int) -> None:
+        """Remove an unfinished invitation registration."""
+        self.execute("DELETE FROM registration_drafts WHERE user_id=?", (user_id,))
+
+    def user_name(self, user_id: int) -> str | None:
+        """Return an activated user's name, if present."""
+        rows = self.all("SELECT name FROM users WHERE id=?", (user_id,))
+        return str(rows[0]["name"]) if rows else None
+
+    def member_name(self, user_id: int) -> str | None:
+        """Return a member's registered name, if present."""
+        rows = self.all("SELECT name FROM members WHERE id=?", (user_id,))
+        return str(rows[0]["name"]) if rows else None
+
+    def name_request(self, user_id: int) -> str | None:
+        """Return the requested replacement name, if present."""
+        rows = self.all("SELECT name FROM name_requests WHERE user_id=?", (user_id,))
+        return str(rows[0]["name"]) if rows else None
+
+    def discard_name_request(self, user_id: int) -> None:
+        """Remove a pending name request."""
+        self.execute("DELETE FROM name_requests WHERE user_id=?", (user_id,))
+
+    def latest_cache_timestamp(self) -> float | None:
+        """Return the newest approved sheet cache timestamp."""
+        row = self.all("SELECT MAX(c.fetched_at) AS timestamp FROM sheet_cache c "
+                       "JOIN sheets s ON s.id=c.sheet_id WHERE s.status='approved'")[0]
+        return row["timestamp"]
+
+    def sheets_by_status(self, status: str) -> list[sqlite3.Row]:
+        """List sheets with the requested moderation status."""
+        return self.all("SELECT * FROM sheets WHERE status=?", (status,))
+
+    def sheet(self, sheet_id: int, status: str) -> sqlite3.Row | None:
+        """Return a sheet only while it has the requested status."""
+        rows = self.all("SELECT * FROM sheets WHERE id=? AND status=?", (sheet_id, status))
+        return rows[0] if rows else None
+
+    def approved_sheets_with_cache_time(self) -> list[sqlite3.Row]:
+        """List approved sheets and their cache timestamps in ID order."""
+        return self.all("SELECT s.*,c.fetched_at FROM sheets s "
+                        "LEFT JOIN sheet_cache c ON c.sheet_id=s.id "
+                        "WHERE s.status='approved' ORDER BY s.id")
+
+    def cached_rows(self, sheet_id: int) -> str | None:
+        """Return serialized rows for a sheet, if cached."""
+        rows = self.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
+        return str(rows[0]["rows"]) if rows else None
+
+    def view(self, view_id: str) -> sqlite3.Row | None:
+        """Return a saved pagination view."""
+        rows = self.all("SELECT * FROM views WHERE id=?", (view_id,))
+        return rows[0] if rows else None
+
+    def member_rows(self) -> list[sqlite3.Row]:
+        """List members with activation state for the admin screen."""
+        return self.all("SELECT m.*,u.id AS active FROM members m "
+                        "LEFT JOIN users u ON u.id=m.id ORDER BY m.name")
+
+    def has_other_members(self) -> bool:
+        """Return whether any non-admin members can be revoked."""
+        return bool(self.all("SELECT id FROM members WHERE id!=?", (self.admin_id(),)))
+
+    def remove_approved_sheet(self, sheet_id: int) -> bool:
+        """Remove an approved sheet by ID."""
+        return bool(self.execute("DELETE FROM sheets WHERE id=? AND status='approved'", (sheet_id,)).rowcount)
+
+    def parser_options(self, sheet_id: int, status: str) -> str | None:
+        """Return serialized parser options for a sheet in the given state."""
+        row = self.sheet(sheet_id, status)
+        return str(row["parser_options"]) if row else None
+
+    def set_parser_options(self, sheet_id: int, options: dict[str, object]) -> None:
+        """Persist parser options for a sheet."""
+        with nullcontext() if self.conn.in_transaction else self.conn:
+            self.conn.execute("UPDATE sheets SET parser_options=? WHERE id=?", (json.dumps(options), sheet_id))
+
+    def moderate_sheet(self, sheet_id: int, approve: bool, parsed: Sheet | None) -> bool:
+        """Apply a moderation decision and queue resulting notifications atomically."""
+        with self.conn:
+            sheet = self.sheet(sheet_id, "pending")
+            if sheet is None:
+                return False
+            if approve:
+                if parsed is None:
+                    raise ValueError("An approved sheet needs parsed data")
+                self.conn.execute("UPDATE sheets SET status='approved' WHERE id=?", (sheet_id,))
+                self.cache(sheet_id, parsed)
+                self.broadcast_table(sheet["title"], sheet["url"])
+            else:
+                self.conn.execute("DELETE FROM sheets WHERE id=?", (sheet_id,))
+            self.queue(sheet["proposer"], [bold("Таблица одобрена" if approve else "Таблица отклонена"),
+                       "", table_link(sheet["title"], sheet["url"])], kind="moderation")
+        return True
+
+    def save_workbook(self, data: dict[str, object], admin_id: int) -> None:
+        """Save configured tabs and resolve their proposal in one transaction."""
+        with self.conn:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
+            proposal = data.get("proposal_id")
+            if proposal:
+                if self.sheet(int(proposal), "pending") is None:
+                    raise SheetError("Предложение уже обработано")
+                self.conn.execute("DELETE FROM sheets WHERE id=?", (proposal,))
+            configured = data["configured"]
+            for item in configured:
+                parsed = Sheet(item["rows"], item["header"], tuple(item["columns"]),
+                               item["header_start"], tuple(item["grade_columns"]))
+                self.add_sheet(item["title"], item["url"], item["header"], item["columns"],
+                               data.get("proposer", admin_id), "approved", parsed=parsed)
+            self.remember_workbook(data["tabs"][0]["url"], data["tabs"])
+            for item in configured:
+                self.broadcast_table(item["title"], item["url"])
+            if proposal:
+                self.queue(data["proposer"], [bold("Таблица одобрена"),
+                           table_link(data["title"], data["url"])], kind="moderation")
+
+    def save_proposal_selection(self, sheet_id: int, selection: dict[str, object],
+                                admin_id: int, title: str, url: str, proposer: int,
+                                actions: list[list[tuple[str, str]]]) -> None:
+        """Store tab choices and the corresponding moderation notification atomically."""
+        with self.conn:
+            if not self.conn.in_transaction:
+                self.conn.execute("BEGIN")
+            self.set_parser_options(sheet_id, selection)
+            self.queue(admin_id, [bold(f"Предложение #{sheet_id}"), table_link(title, url),
+                     f"От пользователя {proposer}",
+                     "Выбери листы для парсинга (по умолчанию выбраны все)"],
+                     kind="proposal", admin=True, actions=actions)
+
+    def store_view(self, view_id: str, owner: int, pages: list[str], admin: bool,
+                   actions: object) -> None:
+        """Persist pages and buttons for an owner-scoped message view."""
+        with nullcontext() if self.conn.in_transaction else self.conn:
+            self.conn.execute("INSERT INTO views(id,owner,pages,admin,actions,created_at) VALUES(?,?,?,?,?,?)",
+                              (view_id, owner, json.dumps(pages), int(admin), json.dumps(actions), time.time()))
+
+    def pending_sheet_ids(self) -> set[int]:
+        """Return identifiers that still need moderation."""
+        return {int(row["id"]) for row in self.all("SELECT id FROM sheets WHERE status='pending'")}
 
     def close(self):
         self.conn.close()

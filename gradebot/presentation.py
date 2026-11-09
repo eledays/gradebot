@@ -2,7 +2,6 @@
 
 import json
 import secrets
-import time
 from html import escape
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
@@ -58,10 +57,7 @@ def create_view(db, owner, lines, *, admin=False, actions=None, pages=None):
             ]
             for index, page in enumerate(pages)
         }
-    db.conn.execute(
-        "INSERT INTO views(id,owner,pages,admin,actions,created_at) VALUES(?,?,?,?,?,?)",
-        (view_id, owner, json.dumps(pages), int(admin), json.dumps(actions or []), time.time()),
-    )
+    db.store_view(view_id, owner, pages, admin, actions or [])
     return view_id, pages
 
 
@@ -81,11 +77,13 @@ def keyboard(view_id, page, total, actions=()):
 
 
 def view_markup(db, view_id, page=0):
-    row = db.all("SELECT * FROM views WHERE id=?", (view_id,))[0]
+    row = db.view(view_id)
+    if row is None:
+        return None
     actions = json.loads(row["actions"])
     if isinstance(actions, dict):
         actions = actions.get(str(page), [])
-    pending = {r["id"] for r in db.all("SELECT id FROM sheets WHERE status='pending'")}
+    pending = db.pending_sheet_ids()
     actions = [
         [
             (label, data)
@@ -98,8 +96,7 @@ def view_markup(db, view_id, page=0):
 
 
 async def send_view(message, db, lines, *, admin=False, actions=None):
-    with db.conn:
-        view_id, pages = create_view(db, message.from_user.id, lines, admin=admin, actions=actions)
+    view_id, pages = create_view(db, message.from_user.id, lines, admin=admin, actions=actions)
     await message.answer(
         pages[0],
         parse_mode="HTML",
