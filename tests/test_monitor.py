@@ -42,6 +42,60 @@ async def test_registration_baseline_new_column_and_edit(db):
     assert bot.send_message.await_count == 1
 
 
+async def test_unchanged_sheet_keeps_pending_comparisons(
+    db: Database,
+) -> None:
+    """Unchanged CSV can still have pending snapshot differences."""
+    monitor = Monitor(db, None, AsyncMock())
+    db.snapshot(123, 1, {"С1": "4"}, [])
+    db.register(456, "Иванов Иван Иванович")
+    db.execute("UPDATE sheet_cache SET fetched_at=1 WHERE sheet_id=1")
+    monitor.fetch = AsyncMock(return_value=parsed())
+    await monitor.scan()
+    assert db.all("SELECT COUNT(*) AS count FROM snapshots")[0]["count"] == 2
+    assert db.all("SELECT fetched_at FROM sheet_cache WHERE sheet_id=1")[0]["fetched_at"] > 1
+    assert {call.args[0] for call in monitor.bot.send_message.await_args_list} == {123, 456}
+    await monitor.scan()
+    assert monitor.bot.send_message.await_count == 2
+
+
+async def test_exact_name_index_preserves_notifications_across_sheets(
+    db: Database, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exact matching uses the index, while only changed grades are sent."""
+    db.add_sheet("Физика", "https://docs.google.com/spreadsheets/d/physics/edit", 1, (1,),
+                 123, "approved", parsed=parsed())
+    monitor = Monitor(db, None, AsyncMock())
+    await monitor.check_user(123)
+    monitor.fetch = AsyncMock(side_effect=[parsed("4"), parsed()])
+
+    def unexpected_lookup(sheet: Sheet, name: str) -> tuple[str, dict[str, str]]:
+        """Exact names should not require scanning every row again."""
+        raise AssertionError(f"Linear lookup used for {name}")
+
+    monkeypatch.setattr(Sheet, "lookup", unexpected_lookup)
+    await monitor.scan()
+    message = monitor.bot.send_message.await_args.args[1]
+    assert "Матан" in message and "Физика" not in message
+
+
+async def test_fresh_sheet_is_reused_for_all_users(
+    db: Database, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fetched sheet is parsed once before comparing multiple users."""
+    db.register(456, "Иванов Иван Иванович")
+    monitor = Monitor(db, None, AsyncMock())
+    monitor.fetch = AsyncMock(return_value=parsed("4"))
+
+    def unexpected_parse(*args: object, **kwargs: object) -> None:
+        """Fail if the monitor rebuilds the fetched parser for each user."""
+        raise AssertionError("Fetched sheet parsed again")
+
+    monkeypatch.setattr("gradebot.monitor.Sheet", unexpected_parse)
+    await monitor.scan()
+    assert {call.args[0] for call in monitor.bot.send_message.await_args_list} == {123, 456}
+
+
 async def test_grade_notification_lists_each_sheet_with_full_title(db):
     base = "https://docs.google.com/spreadsheets/d/book/edit#gid="
     db.add_sheet("Матан · Семинары", base + "1", 1, (1,), 123, "approved")

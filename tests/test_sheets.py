@@ -1,6 +1,6 @@
 import pytest
 
-from gradebot.sheets import Sheet, SheetError, export_url, matches
+from gradebot.sheets import IndexedSheetLookup, Sheet, SheetError, export_url, matches
 
 
 @pytest.mark.parametrize(
@@ -42,6 +42,18 @@ def test_duplicate_exact_names_remain_ambiguous_with_partial_match():
     sheet = Sheet([["ФИО", "Семинар"], ["Иванов Иван", "3"],
                    ["Иванов Иван Иванович", "5"], ["Иван Иванович Иванов", "4"]])
     assert sheet.lookup("Иванов Иван Иванович") == ("ambiguous", {})
+    assert IndexedSheetLookup(sheet).lookup("Иванов Иван Иванович") == ("ambiguous", {})
+
+
+@pytest.mark.parametrize("name", [
+    "Иванов Иван Иванович", "Иванов Иван", "Петров Петр", "Семенов Иван",
+])
+def test_indexed_lookup_matches_regular_lookup(name: str) -> None:
+    """The fast path keeps exact, partial, typo and missing outcomes."""
+    sheet = Sheet([[
+        "ФИО", "Семинар",
+    ], ["Иван Иванович Иванов", "5"], ["Петров Петр", "3"], ["Семёнов Иваан", "4"]])
+    assert IndexedSheetLookup(sheet).lookup(name) == sheet.lookup(name)
 
 
 def test_split_names_header_offset_and_short_rows():

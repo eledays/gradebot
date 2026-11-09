@@ -437,6 +437,10 @@ class Database:
             (sheet_id, json.dumps(parsed.rows), time.time() if fetched_at is None else fetched_at),
         )
 
+    def touch_cache(self, sheet_id: int, fetched_at: float) -> None:
+        """Refresh a cache timestamp when the parsed rows have not changed."""
+        self.conn.execute("UPDATE sheet_cache SET fetched_at=? WHERE sheet_id=?", (fetched_at, sheet_id))
+
     def queue(self, user_id: int, lines: Sequence[str], *, kind: str = "grades",
               actions: object = None, admin: bool = False) -> None:
         """Enqueue a notification and its view in the current transaction."""

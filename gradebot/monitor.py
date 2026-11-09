@@ -18,7 +18,7 @@ from .db import Database
 from .logging_setup import audit
 from .messages import messages
 from .presentation import bold, paginate, safe_lines, table_link, view_markup
-from .sheets import Sheet, discover_sheets, fetch_sheet
+from .sheets import IndexedSheetLookup, Sheet, discover_sheets, fetch_sheet
 from .structure import (
     header_signature,
     structure_message,
@@ -283,52 +283,77 @@ class Monitor:
                 for sheet_id, rows, invalid in structures:
                     if sheet_id in active:
                         structure_notifications += self.record_structure(active[sheet_id], rows, invalid)
-                for sheet_id, parsed, timestamp in fetched:
-                    if self.db.all("SELECT id FROM sheets WHERE id=? AND status='approved'", (sheet_id,)):
-                        self.db.cache(sheet_id, parsed, timestamp)
-                for user in self.db.notification_users():
-                    lines = [bold("Найдены новые оценки"), ""]
-                    changes = {}
-                    for sheet in self.db.all("SELECT * FROM sheets WHERE status='approved'"):
-                        cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet["id"],))
-                        if not cache:
-                            continue
-                        parsed = Sheet(
-                            json.loads(cache[0]["rows"]),
-                            sheet["header_row"],
-                            tuple(json.loads(sheet["name_columns"])),
-                            **json.loads(sheet["parser_options"]),
-                        )
-                        status, grades = parsed.lookup(user["name"])
+                users = self.db.notification_users()
+                fetched_by_id = {sheet_id: (parsed, timestamp) for sheet_id, parsed, timestamp in fetched}
+                original = {sheet["id"]: sheet for sheet in sheets}
+                changes_by_user: dict[int, dict[int, list[tuple[str, str]]]] = {}
+                for sheet in sorted(active.values(), key=lambda item: item["id"]):
+                    sheet_id = sheet["id"]
+                    cache = self.db.all("SELECT rows FROM sheet_cache WHERE sheet_id=?", (sheet_id,))
+                    fresh = fetched_by_id.get(sheet_id)
+                    if fresh is None and not cache:
+                        continue
+                    if fresh is not None:
+                        parsed, timestamp = fresh
+                        source = original[sheet_id]
+                        name_columns = tuple(json.loads(sheet["name_columns"]))
+                        options = json.loads(sheet["parser_options"])
+                        grade_columns = options.get("grade_columns")
+                        selected = tuple(grade_columns) if grade_columns is not None else None
+                        settings_changed = any(source[key] != sheet[key] for key in (
+                            "header_row", "name_columns", "parser_options",
+                        ))
+                        if (settings_changed or parsed.header_row != sheet["header_row"]
+                                or parsed.name_columns != name_columns
+                                or parsed.header_start != options.get("header_start")
+                                or parsed.grade_columns != selected):
+                            parsed = Sheet(parsed.rows, sheet["header_row"], name_columns, **options)
+                        rows_changed = not cache or json.loads(cache[0]["rows"]) != parsed.rows
+                        if rows_changed:
+                            self.db.cache(sheet_id, parsed, timestamp)
+                        else:
+                            self.db.touch_cache(sheet_id, timestamp)
+                    else:
+                        parsed = Sheet(json.loads(cache[0]["rows"]), sheet["header_row"],
+                                       tuple(json.loads(sheet["name_columns"])),
+                                       **json.loads(sheet["parser_options"]))
+                    snapshots = {row["user_id"]: row["grades"] for row in self.db.all(
+                        "SELECT user_id,grades FROM snapshots WHERE sheet_id=?", (sheet_id,)
+                    )}
+                    lookup = IndexedSheetLookup(parsed)
+                    for user in users:
+                        user_id = user["id"]
+                        status, grades = lookup.lookup(user["name"])
                         if status != "found":
                             continue
-                        snapshot = self.db.all(
-                            "SELECT grades FROM snapshots WHERE user_id=? AND sheet_id=?",
-                            (user["id"], sheet["id"]),
-                        )
-                        old = json.loads(snapshot[0]["grades"]) if snapshot else {}
+                        previous_json = snapshots.get(user_id)
+                        previous = json.loads(previous_json) if previous_json is not None else {}
                         values = [
                             (column, value or "оценка удалена")
                             for column, value in grades.items()
-                            if old.get(column, "") != value
+                            if previous.get(column, "") != value
                         ]
                         if values:
-                            changes[sheet["id"]] = values
-                        self.db.conn.execute(
-                            "INSERT INTO snapshots VALUES(?,?,?) "
-                            "ON CONFLICT(user_id,sheet_id) DO UPDATE SET grades=excluded.grades",
-                            (user["id"], sheet["id"], json.dumps(grades)),
-                        )
-                    for sheet in sorted(active.values(), key=lambda item: item["id"]):
-                        if sheet["id"] not in changes:
-                            continue
+                            changes_by_user.setdefault(user_id, {})[sheet_id] = values
+                        if user_id not in snapshots or previous != grades:
+                            self.db.conn.execute(
+                                "INSERT INTO snapshots VALUES(?,?,?) "
+                                "ON CONFLICT(user_id,sheet_id) DO UPDATE SET grades=excluded.grades",
+                                (user_id, sheet_id, json.dumps(grades)),
+                            )
+                for user in users:
+                    changes = changes_by_user.get(user["id"])
+                    if not changes or not user["notifications"]:
+                        continue
+                    lines = [bold("Найдены новые оценки"), ""]
+                    for sheet_id, values in changes.items():
+                        sheet = active[sheet_id]
                         lines.append(bold(self.db.grade_display_title(sheet["title"], sheet["url"])))
-                        for column, value in changes[sheet["id"]]:
+                        for column, value in values:
                             lines.extend(safe_lines(f"- {column}: {value}"))
                         lines.append("")
-                    if len(lines) > 2 and user["notifications"]:
-                        self.db.queue(user["telegram_id"], lines)
-                        notifications += 1
+                    self.db.queue(user["telegram_id"], lines)
+                    notifications += 1
         await self.deliver()
         return {"updated": len(fetched), "failed": failed, "notifications": notifications,
                 "structure_notifications": structure_notifications}

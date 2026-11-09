@@ -185,6 +185,35 @@ class Sheet:
         return "found", grades
 
 
+class IndexedSheetLookup:
+    """Reuse exact-name matches while retaining Sheet's conservative fallback."""
+
+    def __init__(self, sheet: Sheet) -> None:
+        """Index rows by normalized full-name tokens for one comparison cycle."""
+        self.sheet = sheet
+        self.exact: dict[tuple[tuple[str, int], ...], list[list[str]]] = {}
+        for row in sheet.rows[sheet.header_row:]:
+            candidate = " ".join(row[i - 1] if i <= len(row) else "" for i in sheet.name_columns)
+            candidate_tokens = tokens(candidate)
+            if 2 <= sum(candidate_tokens.values()) <= 3:
+                key = tuple(sorted(candidate_tokens.items()))
+                self.exact.setdefault(key, []).append(row)
+
+    def lookup(self, name: str) -> tuple[str, dict[str, str]]:
+        """Use indexed exact matches, falling back for partial and typo matches."""
+        name_tokens = tokens(name)
+        if 2 <= sum(name_tokens.values()) <= 3:
+            exact = self.exact.get(tuple(sorted(name_tokens.items())))
+            if exact:
+                if len(exact) != 1:
+                    return "ambiguous", {}
+                row = exact[0]
+                grades = {label: row[i - 1].strip() if i <= len(row) else ""
+                          for i, label in self.sheet.labels.items()}
+                return "found", grades
+        return self.sheet.lookup(name)
+
+
 async def fetch_sheet(session: aiohttp.ClientSession, url: str, header_row: int = 1,
                       name_columns: tuple[int, ...] = (1,), *, header_start: int | None = None,
                       grade_columns: tuple[int, ...] | None = None,
