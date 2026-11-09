@@ -204,7 +204,7 @@ async def test_add_keeps_title_and_link_state_after_parse_error(dialog_bot, monk
     await h.send("Матан", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
-    await h.send("1 | A", 999)
+    await h.send("1 A", 999)
     await h.send("готово", 999)
     await h.callback(f"worksave:{token}")
     assert await h.state(999) is None
@@ -390,7 +390,7 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
     await h.send("Физика", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
-    await h.send("2 | A:B", 999)
+    await h.send("2 A:B", 999)
     await h.send("готово", 999)
     await h.callback(f"worksave:{token}")
     assert "Ничего не сохранено" in h.replies()[-1]
@@ -400,7 +400,7 @@ async def test_optional_layout_and_duplicate_link_keep_dialog(dialog_bot, monkey
     await h.send("Физика", 999)
     token = (await h.dispatcher.fsm.get_context(bot=h.bot, chat_id=999, user_id=999).get_data())["setup_token"]
     await h.callback(f"tabs:{token}:next")
-    await h.send("2 | A:B", 999)
+    await h.send("2 A:B", 999)
     await h.send("готово", 999)
     await h.callback(f"worksave:{token}")
     assert await h.state(999) is None
@@ -1120,7 +1120,7 @@ async def test_workbook_selection_and_complex_configuration(dialog_bot, monkeypa
     assert picker.inline_keyboard[0][0].text == "✅ Квизы"
     assert picker.inline_keyboard[1][0].text == "Семинары"
     await h.callback(f"tabs:{token}:next")
-    await h.send("1-2 | A", 999)
+    await h.send("1-2 A", 999)
     await h.send("только по названию итог", 999)
     assert (await setup_data(h))["grade_columns"] == [3, 5]
     await h.send("только C,E", 999)
@@ -1212,7 +1212,7 @@ async def test_workbook_save_rolls_back_every_sheet_on_conflict(dialog_bot, monk
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
     for _ in tabs:
-        await h.send("1 | A", 999)
+        await h.send("1 A", 999)
         await h.send("готово", 999)
     h.db.add_sheet("Матан · Второй", "https://docs.google.com/spreadsheets/d/conflict/edit", 1, (1,),
                    999, "approved")
@@ -1246,7 +1246,7 @@ async def test_proposal_picker_selection_survives_until_admin_configuration(dial
     assert any(isinstance(call.args[1], DeleteMessage) for call in h.bot.session.await_args_list)
     data = await setup_data(h)
     assert data["selected"] == [1]
-    await h.send("1 | A", 999)
+    await h.send("1 A", 999)
     await h.send("готово", 999)
     await h.callback(f"worksave:{data['setup_token']}")
     saved = h.db.all("SELECT * FROM sheets")[0]
@@ -1302,7 +1302,7 @@ async def test_compact_auto_setup_buttons_and_stale_sheet_callback(dialog_bot, m
     assert (await setup_data(h))["selected"] == [0, 1]
     await h.callback(f"sheetcfg:{token}:1:layout")
     assert await h.state(999) == Dialog.sheet_layout.state
-    await h.send("1-3\nB", 999)
+    await h.send("1-3 B", 999)
     await h.callback(f"sheetcfg:{token}:1:next")
     assert await h.state(999) == Dialog.workbook_confirm.state
     ready = h.bot.session.await_args.args[1]
@@ -1332,8 +1332,13 @@ async def test_auto_setup_falls_back_to_short_manual_prompt(dialog_bot, monkeypa
     assert len(h.replies()[-1]) < 600
     assert "Иванов Иван" not in h.replies()[-1]
     assert "Для листа «Лист 1» не удалось определить структуру автоматически" in h.replies()[-1]
+    assert "<code>1-3 A</code>" in h.replies()[-1]
     assert "Строка 1:" not in h.replies()[-1]
-    await h.send("1\nA", 999)
+    for old_format in ("1\nA", "1 | A"):
+        await h.send(old_format, 999)
+        assert await h.state(999) == Dialog.sheet_layout.state
+        assert "<code>1-3 A</code>" in h.replies()[-1]
+    await h.send("1 A", 999)
     await h.callback(f"sheetcfg:{token}:0:next")
     assert await h.state(999) == Dialog.workbook_confirm.state
 
@@ -1354,7 +1359,7 @@ async def test_setup_preview_uses_one_student_row_and_bounds_values(
     await h.send("Матан", 999)
     token = (await setup_data(h))["setup_token"]
     await h.callback(f"tabs:{token}:next")
-    await h.send("1\nA:B", 999)
+    await h.send("1 A:B", 999)
     preview = h.replies()[-1]
     assert all(line in preview for line in expected)
     assert "Иванов" not in preview and "служебное значение" not in preview

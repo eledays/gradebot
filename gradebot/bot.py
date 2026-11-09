@@ -1454,6 +1454,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
 
     @router.message(Dialog.sheet_columns, F.text.contains("|"), ~F.text.startswith("/"))
     @router.message(Dialog.sheet_columns, F.text.contains("\n"), ~F.text.startswith("/"))
+    @router.message(Dialog.sheet_columns, F.text.regexp(r"^\s*\d+(?:-\d+)?\s+\S"))
     @router.message(Dialog.sheet_layout, F.text, ~F.text.startswith("/"))
     async def workbook_layout(message: Message, state: FSMContext) -> None:
         """Handle the workbook layout interaction."""
@@ -1468,7 +1469,9 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             if message.text.strip().casefold() == "по умолчанию":
                 headers, names = str(data["header"]), ",".join(str(i) for i in data["columns"])
             else:
-                parts = message.text.split("|", 1) if "|" in message.text else message.text.splitlines()
+                if "|" in message.text or "\n" in message.text:
+                    raise ValueError
+                parts = message.text.strip().split(maxsplit=1)
                 if len(parts) != 2:
                     raise ValueError
                 headers, names = parts
@@ -1485,7 +1488,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             if not await show_columns(message, state):
                 return
         except (ValueError, SheetError):
-            await message.answer(messages.render("replies.workbook_layout_1"))
+            await message.answer(messages.render("replies.workbook_layout_1"), parse_mode="HTML")
             return
         await state.set_state(Dialog.sheet_columns)
 
@@ -1499,7 +1502,7 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         text = message.text.strip().casefold()
         if text == "назад":
             await state.set_state(Dialog.sheet_layout)
-            await message.answer(messages.render("replies.workbook_columns_1"))
+            await message.answer(messages.render("replies.workbook_columns_1"), parse_mode="HTML")
             return
         if text == "пропустить":
             await skip_current(message, state)
