@@ -28,7 +28,7 @@ admin = """
 /removetable — удалить таблицу со всеми листами
 /members — список пользователей
 /invite — создать ссылку на 24 часа (или /invite ЧАСЫ)
-/rename ID ФИО — изменить ФИО пользователя
+/rename ID ФИО — изменить ФИО пользователя (ID из /members)
 /revoke — заблокировать пользователя"""
 contact = "Для связи: @{username}"
 
@@ -150,17 +150,21 @@ remove_sheet_stale = "Лист уже удалён"
 confirm_dismissed = "Отменил"
 revoke_done = "Пользователь заблокирован"
 members_1 = "Эта команда недоступна"
+members_empty = "Список пуст"
+members_row = "#{local_id}: {name} - {username}"
+members_total = "Всего пользователей: {count}"
 invite_1 = "Эта команда недоступна"
 invite_2 = "Укажи срок от 1 до 720 часов: /invite 24"
 rename_member_1 = "Эта команда недоступна"
-rename_member_2 = "Формат: /rename ID Фамилия Имя"
+rename_member_2 = "Формат: /rename ID Фамилия Имя. ID возьми из /members"
 rename_member_3 = "Пользователь не найден"
 rename_member_4 = "ФИО изменено"
 revoke_1 = "Эта команда недоступна"
 revoke_2 = "Нет пользователей для закрытия доступа"
-revoke_3 = "Отправь ID пользователя из /members, чтобы закрыть доступ. /cancel — отменить"
+revoke_3 = "Отправь локальный ID пользователя из /members, чтобы закрыть доступ. /cancel — отменить"
 revoke_id_1 = "Нужен числовой ID из /members"
 ask_revoke_1 = "Пользователь не найден или это текущий администратор"
+ask_revoke_confirm = "Заблокировать {name}?"
 confirm_1 = "Только для админа"
 confirm_2 = "Подтверждение устарело"
 confirm_3 = "Нельзя закрыть доступ текущему админу"

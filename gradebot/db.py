@@ -679,13 +679,24 @@ class Database:
         return rows[0] if rows else None
 
     def member_rows(self) -> list[sqlite3.Row]:
-        """List members with activation state for the admin screen."""
-        return self.all("SELECT m.*,u.id AS active FROM members m "
-                        "LEFT JOIN users u ON u.telegram_id=m.id ORDER BY m.name")
+        """List active members with their local user IDs for the admin screen."""
+        return self.all(
+            "SELECT u.id AS local_id,u.telegram_id,m.name,m.username FROM users u "
+            "JOIN members m ON m.id=u.telegram_id ORDER BY m.name,u.id"
+        )
+
+    def member_by_local_id(self, local_id: int) -> sqlite3.Row | None:
+        """Resolve a displayed local user ID to its member and Telegram ID."""
+        rows = self.all(
+            "SELECT u.telegram_id,m.name FROM users u "
+            "JOIN members m ON m.id=u.telegram_id WHERE u.id=?", (local_id,)
+        )
+        return rows[0] if rows else None
 
     def has_other_members(self) -> bool:
-        """Return whether any non-admin members can be revoked."""
-        return bool(self.all("SELECT id FROM members WHERE id!=?", (self.admin_id(),)))
+        """Return whether any listed non-admin users can be revoked."""
+        return bool(self.all("SELECT 1 FROM users u JOIN members m ON m.id=u.telegram_id "
+                             "WHERE u.telegram_id!=?", (self.admin_id(),)))
 
     def approved_sheet_with_workbook(self, sheet_id: int) -> sqlite3.Row | None:
         """Return one approved sheet with its parent title for confirmation."""

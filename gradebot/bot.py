@@ -1030,16 +1030,12 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         lines = [bold("Пользователи группы"), ""]
         for row in rows:
             label = f"@{row['username']}" if row["username"] else "без юзернейма"
-            anchor = f"#{row['id']}:"
-            lines.extend(safe_lines(f"{anchor} {row['name']} - {label} - ID {row['id']}"))
-            lines.append("Вход выполнен" if row["active"] else "Ещё не заходил")
-            lines.append("")
-        await send_view(
-            message,
-            db,
-            lines if rows else ["Список пуст"],
-            admin=True,
-        )
+            lines.append(messages.render("replies.members_row", local_id=row["local_id"],
+                                         name=row["name"], username=label))
+        if not rows:
+            lines.append(messages.render("replies.members_empty"))
+        lines.extend(["", messages.render("replies.members_total", count=len(rows))])
+        await send_view(message, db, lines, admin=True)
 
     @router.message(F.text == "Создать ссылку")
     @router.message(Command("invite"))
@@ -1073,12 +1069,13 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
         if len(parts) != 3 or not parts[1].isdigit() or not valid_name(" ".join(parts[2].split())):
             await message.answer(messages.render("replies.rename_member_2"))
             return
-        user_id, name = int(parts[1]), " ".join(parts[2].split())
-        if not db.change_name(user_id, name):
+        local_id, name = int(parts[1]), " ".join(parts[2].split())
+        member = db.member_by_local_id(local_id)
+        if member is None or not db.change_name(member["telegram_id"], name):
             await message.answer(messages.render("replies.rename_member_3"))
             return
         await message.answer(messages.render("replies.rename_member_4"))
-        await message.bot.send_message(user_id, f"Администратор изменил ФИО на {name}")
+        await message.bot.send_message(member["telegram_id"], f"Администратор изменил ФИО на {name}")
 
     @router.message(F.text == "Заблокировать")
     @router.message(Command("revoke"))
@@ -1102,25 +1099,26 @@ def create_router(db: Database, monitor: Monitor | None, contact_username: str =
             await state.clear()
             return
         try:
-            user_id = int(message.text.strip())
-            if not 0 < user_id < 2**63:
+            local_id = int(message.text.strip())
+            if not 0 < local_id < 2**63:
                 raise ValueError
         except ValueError:
             await message.answer(messages.render("replies.revoke_id_1"))
             return
-        await ask_revoke(message, state, user_id)
+        await ask_revoke(message, state, local_id)
 
-    async def ask_revoke(message: Message, state: FSMContext, user_id: int) -> None:
+    async def ask_revoke(message: Message, state: FSMContext, local_id: int) -> None:
         """Ask the administrator to confirm a member block."""
-        name = db.member_name(user_id)
-        if name is None or user_id == db.admin_id():
+        member = db.member_by_local_id(local_id)
+        if member is None or member["telegram_id"] == db.admin_id():
             await message.answer(messages.render("replies.ask_revoke_1"))
             return
         token = secrets.token_hex(8)
-        await state.update_data(member_id=user_id, token=token)
+        await state.update_data(member_id=member["telegram_id"], token=token)
         await state.set_state(Dialog.revoke_confirm)
         await message.answer(
-            f"Заблокировать {name}?",
+            messages.render("replies.ask_revoke_confirm", name=member["name"]),
+            parse_mode="HTML",
             reply_markup=confirmation("revoke", token, "Заблокировать"),
         )
 

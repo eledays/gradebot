@@ -124,11 +124,12 @@ async def test_name_request_shows_admin_profile_and_both_names(app):
 
 async def test_revocation_clears_private_data_and_blocks_old_pages(app):
     app.db.register(123, "Иванов Иван")
+    local_id = app.db.all("SELECT id FROM users WHERE telegram_id=123")[0]["id"]
     with app.db.conn:
         view, _ = create_view(app.db, 123, ["old grades", "x" * 3000, "y" * 3000])
         app.db.queue(123, ["pending grades"])
     await app.send("/revoke")
-    await app.send("123")
+    await app.send(str(local_id))
     data = await app.context().get_data()
     assert app.db.authorized(123)
     await app.click(f"revoke:{data['token']}")
@@ -330,6 +331,7 @@ async def test_removing_one_of_two_sheets_keeps_workbook_without_offer(app):
 
 async def test_admin_can_revoke_by_id_and_outsider_cannot(app):
     app.db.register(123, "Иванов Иван")
+    local_id = app.db.all("SELECT id FROM users WHERE telegram_id=123")[0]["id"]
     await app.send("Пользователи")
     method = app.bot.session.await_args.args[1]
     assert method.reply_markup is None
@@ -337,13 +339,40 @@ async def test_admin_can_revoke_by_id_and_outsider_cannot(app):
     assert app.db.authorized(123)
     assert app.replies()[-1] == "Эта команда недоступна"
     await app.send("/revoke")
-    assert "Отправь ID пользователя" in app.replies()[-1]
+    assert "Отправь локальный ID пользователя" in app.replies()[-1]
     await app.send("не число")
     assert "числовой ID" in app.replies()[-1]
     await app.send("777")
     assert "Пользователь не найден" in app.replies()[-1]
-    await app.send("123")
+    await app.send(str(local_id))
     assert app.db.authorized(123)
     data = await app.context().get_data()
     await app.click(f"revoke:{data['token']}")
     assert not app.db.authorized(123)
+
+
+async def test_members_lists_local_ids_compactly_and_counts_users(app):
+    app.db.register(999, "Админ Админ")
+    app.db.grant_members([(123, "ivanov", "Иванов Иван"), (456, "", "Петров Петр")])
+    app.db.activate(123)
+    app.db.activate(456)
+
+    await app.send("/members")
+
+    assert app.replies()[-1] == (
+        "<b>Пользователи группы</b>\n\n"
+        "#1: Админ Админ - без юзернейма\n"
+        "#2: Иванов Иван - @ivanov\n"
+        "#3: Петров Петр - без юзернейма\n\n"
+        "Всего пользователей: 3"
+    )
+
+
+async def test_rename_uses_local_id_from_members(app):
+    app.db.register(999, "Админ Админ")
+    app.db.register(123, "Иванов Иван")
+
+    await app.send("/rename 2 Петров Петр")
+
+    assert app.db.member_name(123) == "Петров Петр"
+    assert app.db.user_name(123) == "Петров Петр"
